@@ -1,0 +1,11 @@
+*.json
+target/debug/.fingerprint
+target/debug/incremental
+target/debug/build
+target/debug/examples
+target/debug/deps
+target/*/debug/.fingerprint
+target/*/debug/incremental
+target/*/debug/build
+target/*/debug/examples
+target/*/debug/deps

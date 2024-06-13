@@ -1,0 +1,1 @@
+{"metric_stream_name":"my-metric-stream","account_id":"216274072664","region":"us-west-2","namespace":"AWS/ElastiCache","metric_name":"SwapUsage","dimensions":{"CacheClusterId":"production-sidekiq-001","CacheNodeId":"0001"},"timestamp":1718040420000,"value":{"max":786432.0,"min":786432.0,"sum":786432.0,"count":1.0},"unit":"Bytes"}
