@@ -51,7 +51,7 @@ pub async fn push_firehose_metrics() -> anyhow::Result<bool> {
 
     let metric_families = prometheus::gather();
     let text_metric_families = TextEncoder::new().encode_to_string(&metric_families)?;
-    info!("{text_metric_families}");
+    //info!("{text_metric_families}");
     let encoded_write_request = WriteRequest::from_text_format(text_metric_families).unwrap();
     let url = format!("{addr}/api/v1/write");
     let body = encoded_write_request.encode_compressed()?;
@@ -81,7 +81,7 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
         dims.as_str(),
     ];
     match incoming_metric.unit {
-        MetricUnit::Bytes | MetricUnit::Percent | MetricUnit::Average => {
+        MetricUnit::Count | MetricUnit::Bytes | MetricUnit::Percent | MetricUnit::Average => {
             let mut recorder = GAUGES.lock().await;
             let outgoing_gauge: GaugeVec = match recorder.get(&incoming_metric.metric_name) {
                 None => {
@@ -136,7 +136,9 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
             }
             recorder.insert(incoming_metric.metric_name, outgoing_gauge);
         }
-        MetricUnit::Count => {}
+        // MetricUnit::Count => {
+        //     warn!("Received a count -- need to implement this")
+        // }
         MetricUnit::Unknown => {
             warn!("Received unknown metric, {:#?}", incoming_metric);
         }

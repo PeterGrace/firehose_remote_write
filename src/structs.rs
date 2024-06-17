@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use strum::Display;
 use tokio::sync::RwLock;
+use tracing_subscriber::registry::Data;
 
 pub type SharedState = Arc<RwLock<AppState>>;
 #[derive(Default, Debug, Deserialize, Clone)]
@@ -12,14 +13,21 @@ pub struct AppState {
     // leaving this unimplemented for now
     _string: Option<String>,
 }
+#[derive(Default, Deserialize)]
+pub struct FirehoseData {
+    pub(crate) data: String
+}
+
 
 #[derive(Default, Deserialize)]
 pub struct Firehose {
-    pub(crate) message: String,
-    pub(crate) request_id: String,
-    pub(crate) source_arn: String,
-    pub(crate) source_type: String,
-    pub(crate) timestamp: String,
+    pub(crate) message: Option<String>,
+    pub(crate) records: Option<Vec<FirehoseData>>,
+    #[serde(rename="requestId")]
+    pub(crate) request_id: Option<String>,
+    pub(crate) source_arn: Option<String>,
+    pub(crate) source_type: Option<String>,
+    pub(crate) timestamp: Option<u64>,
 }
 
 #[derive(Default, Deserialize, Debug, Clone)]

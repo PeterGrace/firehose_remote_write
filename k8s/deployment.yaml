@@ -21,9 +21,8 @@ spec:
       labels:
         app.kubernetes.io/name: firehose-remote-write
     spec:
-      serviceAccountName: firehose-remote-write
       containers:
-      - image: docker.io/petergrace/firehose_remote_write:latest
+      - image: IMAGE:TAG
         imagePullPolicy: Always
         name: firehose-remote-write
         ports:

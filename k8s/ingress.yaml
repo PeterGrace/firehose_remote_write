@@ -4,7 +4,11 @@ metadata:
   annotations:
     app.kubernetes.io/name: firehose-remote-write
     kubernetes.io/tls-acme: "true"
-  generation: 10
+    nginx.ingress.kubernetes.io/proxy-body-size: 64m
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "16"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16m"
+    nginx.ingress.kubernetes.io/proxy-max-temp-file-size: "1024m"
   name: firehose-remote-write
 spec:
   ingressClassName: nginx
@@ -16,7 +20,7 @@ spec:
           service:
             name: firehose-remote-write
             port:
-              number: 8765
+              number: 3000
         path: /
         pathType: Prefix
   tls:

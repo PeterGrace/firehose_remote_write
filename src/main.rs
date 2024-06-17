@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
+use base64::prelude::*;
 
 #[tokio::main]
 async fn main() {
@@ -58,9 +59,22 @@ async fn get_firehose(
     headers: HeaderMap,
     extract::Json(payload): extract::Json<Firehose>,
 ) -> Result<String, StatusCode> {
+    let mut payload_message: String = String::from("");
     info!("Entering get-firehose");
-    for line in payload.message.lines() {
-        info!("Processing {line}");
+    if let Some(records) = payload.records {
+        // although it's not beyond belief that amazon would send us malformed b64, it's unlikely,
+        // so I'm skipping error processing here for now
+        payload_message = records.iter().map(|s| {
+            String::from_utf8(BASE64_STANDARD.decode(&s.data).unwrap()).unwrap()
+        }).collect::<Vec<String>>().join("");
+        info!("We received a records payload");
+    };
+    if let Some(message) = payload.message {
+        payload_message = message;
+        info!("We received a plain message payload");
+    }
+    for line in payload_message.lines() {
+        trace!("Processing {line}");
         let metric: CloudWatchMetric = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
