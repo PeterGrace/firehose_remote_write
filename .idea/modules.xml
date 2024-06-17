@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/firehose_to_prom_push.iml" filepath="$PROJECT_DIR$/.idea/firehose_to_prom_push.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/firehose_remote_write.iml" filepath="$PROJECT_DIR$/.idea/firehose_remote_write.iml" />
     </modules>
   </component>
 </project>
