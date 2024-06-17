@@ -899,8 +899,7 @@ dependencies = [
 [[package]]
 name = "prometheus-parse"
 version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "811031bea65e5a401fb2e1f37d802cca6601e204ac463809a3189352d13b78a5"
+source = "git+https://github.com/Fraser999/prometheus-parse-rs.git#da5ddbefd9d2881e422f1c07acaca6598b8245f8"
 dependencies = [
  "chrono",
  "itertools",
@@ -911,8 +910,7 @@ dependencies = [
 [[package]]
 name = "prometheus_remote_write"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05f1637f1aa05a571a5eca64076d7be15a218f9b0dfa1ebdbd2b9fa5168cee8d"
+source = "git+https://github.com/PeterGrace/prom-write.git#0ac8baac20839325f59df2a21390e1a819558043"
 dependencies = [
  "http 0.2.12",
  "prometheus-parse",
@@ -1740,9 +1738,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "0.26.2"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c452ad30530b54a4d8e71952716a212b08efd0f3562baa66c29a618b07da7c3"
+checksum = "bd7c23921eeb1713a4e851530e9b9756e4fb0e89978582942612524cf09f01cd"
 dependencies = [
  "rustls-pki-types",
 ]

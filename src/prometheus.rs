@@ -54,6 +54,7 @@ pub async fn push_firehose_metrics() -> anyhow::Result<bool> {
     let text_metric_families = TextEncoder::new().encode_to_string(&metric_families)?;
     //info!("{text_metric_families}");
     let encoded_write_request = WriteRequest::from_text_format(text_metric_families).unwrap();
+    //info!("{:#?}", encoded_write_request);
     let url = format!("{addr}/api/v1/write");
     let body = encoded_write_request.encode_compressed()?;
     let rs = client.post(url).body(body).send().await?;
@@ -122,35 +123,39 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
             };
 
             if incoming_metric.value.max.is_some() {
-                let mut dims = label_values.clone();
-                dims.push("max");
+                let mut labels = label_values.clone();
+                labels.push("max");
+
                 let m = outgoing_gauge
-                    .with_label_values(&dims.clone());
+                    .with_label_values(&labels.clone());
                 m.set_timestamp_ms(incoming_metric.timestamp as i64);
                 m.set(incoming_metric.value.max.unwrap() as f64);
             }
             if incoming_metric.value.min.is_some() {
-                let mut dims = label_values.clone();
-                dims.push("min");
+                let mut labels = label_values.clone();
+                labels.push("min");
+
                 let m = outgoing_gauge
-                    .with_label_values(&dims.clone());
+                    .with_label_values(&labels.clone());
                 m.set_timestamp_ms(incoming_metric.timestamp as i64);
                 m.set(incoming_metric.value.min.unwrap() as f64);
 
             }
             if incoming_metric.value.sum.is_some() {
-                let mut dims = label_values.clone();
-                dims.push("sum");
+                let mut labels = label_values.clone();
+                labels.push("sum");
+
                 let m = outgoing_gauge
-                    .with_label_values(&dims.clone());
+                    .with_label_values(&labels.clone());
                 m.set_timestamp_ms(incoming_metric.timestamp as i64);
                 m.set(incoming_metric.value.sum.unwrap() as f64);
             }
             if incoming_metric.value.count.is_some() {
-                let mut dims = label_values.clone();
-                dims.push("count");
+                let mut labels = label_values.clone();
+                labels.push("count");
+
                 let m = outgoing_gauge
-                    .with_label_values(&dims.clone());
+                    .with_label_values(&labels.clone());
                 m.set_timestamp_ms(incoming_metric.timestamp as i64);
                 m.set(incoming_metric.value.count.unwrap() as f64);
             }

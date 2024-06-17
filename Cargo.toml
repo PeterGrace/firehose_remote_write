@@ -18,5 +18,5 @@ url = "2.5.0"
 reqwest = { version = "0.12.4", default_features = false, features = ["rustls-tls"] }
 strum = { version = "0.26.2", features = ["derive", "strum_macros"] }
 prometheus = { git = "https://github.com/PeterGrace/rust-prometheus" }
-prometheus_remote_write = "0.2.1"
+prometheus_remote_write ={ git = "https://github.com/PeterGrace/prom-write.git" }
 base64 = "0.22.1"
