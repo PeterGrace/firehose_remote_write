@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: firehose-remote-write
+  labels:
+    app.kubernetes.io/name: firehose-remote-write
+spec:
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - appProtocol: http
+    name: http
+    port: 3000
+    protocol: TCP
+    targetPort: http
+  selector:
+    app.kubernetes.io/name: firehose-remote-write
+  sessionAffinity: None
+  type: ClusterIP

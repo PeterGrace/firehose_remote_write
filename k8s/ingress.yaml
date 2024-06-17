@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    app.kubernetes.io/name: firehose-remote-write
+    kubernetes.io/tls-acme: "true"
+  generation: 10
+  name: firehose-remote-write
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: firehose-remote-write.utility.stackblitz.dev
+    http:
+      paths:
+      - backend:
+          service:
+            name: firehose-remote-write
+            port:
+              number: 8765
+        path: /
+        pathType: Prefix
+  tls:
+  - hosts:
+    - firehose-remote-write.utility.stackblitz.dev
+    secretName: firehose-remote-write-tls
