@@ -1,30 +1,29 @@
-pub(crate) mod structs;
-mod prometheus;
 mod consts;
+mod prometheus;
+pub(crate) mod structs;
 
 #[macro_use]
 extern crate tracing;
 #[macro_use]
 extern crate anyhow;
 
-use crate::structs::{CloudWatchMetric, Firehose, MetricUnit, MetricValue};
+use crate::prometheus::{push_firehose_metrics, record_metric};
 use crate::structs::AppState;
 use crate::structs::SharedState;
+use crate::structs::{CloudWatchMetric, Firehose, MetricUnit, MetricValue};
+use ::prometheus::core::Metric;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::{get, post};
+use axum::{debug_handler, extract, Json, Router};
+use serde::Deserialize;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
-use ::prometheus::core::Metric;
-use axum::{debug_handler, extract, Json, Router};
-use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::http::header::CONTENT_TYPE;
-use axum::routing::{get, post};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
-use serde::Deserialize;
-use crate::prometheus::{record_metric, push_firehose_metrics};
-
 
 #[tokio::main]
 async fn main() {
@@ -43,7 +42,6 @@ async fn main() {
         *state = AppState::default();
     }
 
-
     let app = Router::new()
         .route("/", post(get_firehose).put(get_firehose))
         .with_state(Arc::clone(&shared_state));
@@ -55,7 +53,11 @@ async fn main() {
 }
 
 #[debug_handler]
-async fn get_firehose(State(state): State<SharedState>, headers: HeaderMap, extract::Json(payload): extract::Json<Firehose>) -> Result<String, StatusCode> {
+async fn get_firehose(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    extract::Json(payload): extract::Json<Firehose>,
+) -> Result<String, StatusCode> {
     info!("Entering get-firehose");
     for line in payload.message.lines() {
         info!("Processing {line}");
