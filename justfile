@@ -2,7 +2,7 @@ commit := `git rev-parse HEAD`
 shortcommit := `git rev-parse HEAD`
 transport := "docker://"
 registry := "docker.io"
-image := "petergrace/firehose_to_prom_push"
+image := "petergrace/firehose_remote_write"
 tag := `git describe --tags 2>/dev/null|| echo dev`
 
 

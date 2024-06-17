@@ -8,4 +8,4 @@ then
     sleep infinity
 
 fi
-/opt/app/firehose_to_prom_push
+/opt/app/firehose_remote_write
