@@ -11,6 +11,7 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
+use axum::http::StatusCode;
 use tokio::sync::Mutex;
 use url::Url;
 macro_rules! app_opts {
@@ -56,7 +57,17 @@ pub async fn push_firehose_metrics() -> anyhow::Result<bool> {
     let url = format!("{addr}/api/v1/write");
     let body = encoded_write_request.encode_compressed()?;
     let rs = client.post(url).body(body).send().await?;
-    rs.error_for_status()?;
+    if rs.status().clone() == StatusCode::BAD_REQUEST {
+        let text = rs.text().await?;
+        match text.as_str().trim() {
+            "out of order sample" | "duplicate sample for timestamp" => {
+                debug!("One or more samples in this push were duplicated or out-of-order.  Not much we can do about this.")
+            }
+            _ => {
+                bail!("400 Bad request: {:#?}", text.as_bytes())
+            }
+        };
+    }
     Ok(true)
 }
 
@@ -96,6 +107,7 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
                         ]
                     )
                     .unwrap();
+                    recorder.insert(incoming_metric.metric_name, gv.clone());
                     gv
                 }
                 Some(m) => m.clone(),
@@ -134,7 +146,7 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
                 m.set_timestamp_ms(incoming_metric.timestamp as i64);
                 m.set(incoming_metric.value.count.unwrap() as f64);
             }
-            recorder.insert(incoming_metric.metric_name, outgoing_gauge);
+
         }
         // MetricUnit::Count => {
         //     warn!("Received a count -- need to implement this")

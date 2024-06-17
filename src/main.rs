@@ -60,18 +60,17 @@ async fn get_firehose(
     extract::Json(payload): extract::Json<Firehose>,
 ) -> Result<String, StatusCode> {
     let mut payload_message: String = String::from("");
-    info!("Entering get-firehose");
     if let Some(records) = payload.records {
         // although it's not beyond belief that amazon would send us malformed b64, it's unlikely,
         // so I'm skipping error processing here for now
         payload_message = records.iter().map(|s| {
             String::from_utf8(BASE64_STANDARD.decode(&s.data).unwrap()).unwrap()
         }).collect::<Vec<String>>().join("");
-        info!("We received a records payload");
+        debug!("We received a records payload");
     };
     if let Some(message) = payload.message {
         payload_message = message;
-        info!("We received a plain message payload");
+        debug!("We received a plain message payload");
     }
     for line in payload_message.lines() {
         trace!("Processing {line}");
@@ -86,7 +85,7 @@ async fn get_firehose(
     }
     match push_firehose_metrics().await {
         Ok(_) => {
-            info!("succeeded on push")
+            debug!("succeeded on push")
         }
         Err(e) => {
             error!("Failed to push metrics: {e}");
