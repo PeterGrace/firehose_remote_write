@@ -92,7 +92,15 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
         dims.as_str(),
     ];
     match incoming_metric.unit {
-        MetricUnit::Count | MetricUnit::Bytes | MetricUnit::Percent | MetricUnit::Average => {
+        MetricUnit::Count
+        | MetricUnit::Bytes
+        | MetricUnit::Percent
+        | MetricUnit::Average
+        | MetricUnit::Seconds
+        | MetricUnit::CountPerSecond
+        | MetricUnit::BytesPerSecond
+        | MetricUnit::None
+        => {
             let mut recorder = GAUGES.lock().await;
             let outgoing_gauge: GaugeVec = match recorder.get(&incoming_metric.metric_name) {
                 None => {

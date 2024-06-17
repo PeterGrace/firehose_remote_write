@@ -62,7 +62,13 @@ pub enum MetricUnit {
     Bytes,
     Count,
     Percent,
+    Seconds,
     Average,
+    #[serde(rename="Count/Second")]
+    CountPerSecond,
+#[serde(rename="Bytes/Second")]
+BytesPerSecond,
+    None
 }
 
 impl DimensionMap {
