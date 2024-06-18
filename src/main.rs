@@ -7,7 +7,7 @@ extern crate tracing;
 #[macro_use]
 extern crate anyhow;
 
-use crate::prometheus::{push_firehose_metrics, record_metric};
+use crate::prometheus::{push_firehose_metrics, record_metric, STREAMS_RECEIVED};
 use crate::structs::AppState;
 use crate::structs::SharedState;
 use crate::structs::{CloudWatchMetric, Firehose, MetricUnit, MetricValue};
@@ -83,6 +83,7 @@ async fn get_firehose(
         };
         record_metric(metric).await;
     }
+    STREAMS_RECEIVED.with_label_values(&[]).inc();
     match push_firehose_metrics().await {
         Ok(_) => {
             debug!("succeeded on push")

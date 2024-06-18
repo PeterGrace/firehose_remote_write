@@ -41,6 +41,22 @@ lazy_static! {
         &["crate_version", "git_hash"]
     )
     .unwrap();
+    pub static ref STREAMS_RECEIVED: CounterVec = register_counter_vec!(
+        app_opts!(
+            "self_kinesis_payloads_received_count",
+            "The number of kinesis payloads received"
+        ),
+        &[]
+    )
+    .unwrap();
+    pub static ref TOTAL_WRITES_SENT: CounterVec = register_counter_vec!(
+        app_opts!(
+            "self_remote_writes_sent_count",
+            "The number of remnote writes attempted"
+        ),
+        &["status_code"]
+    )
+    .unwrap();
 }
 
 pub async fn push_firehose_metrics() -> anyhow::Result<bool> {
@@ -58,17 +74,42 @@ pub async fn push_firehose_metrics() -> anyhow::Result<bool> {
     let url = format!("{addr}/api/v1/write");
     let body = encoded_write_request.encode_compressed()?;
     let rs = client.post(url).body(body).send().await?;
+    TOTAL_WRITES_SENT.with_label_values(&[rs.status().clone().as_str()]).inc();
     if rs.status().clone() == StatusCode::BAD_REQUEST {
         let text = rs.text().await?;
         match text.as_str().trim() {
-            "out of order sample" | "duplicate sample for timestamp" => {
+            "out of order sample" 
+                | "duplicate sample for timestamp" 
+                | "Out of order sample from remote write" => {
                 debug!("One or more samples in this push were duplicated or out-of-order.  Not much we can do about this.")
             }
             _ => {
-                bail!("400 Bad request: {:#?}", text.as_bytes())
+                bail!("400 Bad request: {text}")
             }
         };
     }
+    // now that we've sent them, lets delete them so that they don't pollute future samples
+    let mut collectors = GAUGES.lock().await;
+    for (key, collector) in collectors.iter() {
+        if let Err(e) = prometheus::unregister(Box::new(collector.clone())) {
+            error!("Couldn't unregister collector: {e}");
+        }
+    }
+    collectors.clear();
+    let mut collectors = COUNTERS.lock().await;
+    for (key, collector) in collectors.iter() {
+        if let Err(e) = prometheus::unregister(Box::new(collector.clone())) {
+            error!("Couldn't unregister collector: {e}");
+        }
+    }
+    collectors.clear();
+    let mut collectors = HISTOGRAMS.lock().await;
+    for (key, collector) in collectors.iter() {
+        if let Err(e) = prometheus::unregister(Box::new(collector.clone())) {
+            error!("Couldn't unregister collector: {e}");
+        }
+    }
+    collectors.clear();
     Ok(true)
 }
 
