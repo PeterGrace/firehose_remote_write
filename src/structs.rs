@@ -64,10 +64,12 @@ pub enum MetricUnit {
     Percent,
     Seconds,
     Average,
+    Milliseconds,
+    Microseconds,
     #[serde(rename="Count/Second")]
     CountPerSecond,
-#[serde(rename="Bytes/Second")]
-BytesPerSecond,
+    #[serde(rename="Bytes/Second")]
+    BytesPerSecond,
     None
 }
 
