@@ -76,7 +76,8 @@ impl DimensionMap {
     pub fn to_kv(&self) -> String {
         let mut dims: Vec<String> = vec![];
         for (k, v) in self.0.iter() {
-            //dims.push(format!("{k}={v}"));
+            //dims.push(format!("{k}->{v}"));
+            dims.push(format!("{k}={v}"));
         }
         //let d = dims.join(".");
         let d = dims.join(",");
