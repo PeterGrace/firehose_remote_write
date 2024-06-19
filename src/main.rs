@@ -18,13 +18,13 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{debug_handler, extract, Json, Router};
+use base64::prelude::*;
 use serde::Deserialize;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
-use base64::prelude::*;
 
 #[tokio::main]
 async fn main() {
@@ -63,9 +63,11 @@ async fn get_firehose(
     if let Some(records) = payload.records {
         // although it's not beyond belief that amazon would send us malformed b64, it's unlikely,
         // so I'm skipping error processing here for now
-        payload_message = records.iter().map(|s| {
-            String::from_utf8(BASE64_STANDARD.decode(&s.data).unwrap()).unwrap()
-        }).collect::<Vec<String>>().join("");
+        payload_message = records
+            .iter()
+            .map(|s| String::from_utf8(BASE64_STANDARD.decode(&s.data).unwrap()).unwrap())
+            .collect::<Vec<String>>()
+            .join("");
         debug!("We received a records payload");
     };
     if let Some(message) = payload.message {

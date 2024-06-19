@@ -15,15 +15,14 @@ pub struct AppState {
 }
 #[derive(Default, Deserialize)]
 pub struct FirehoseData {
-    pub(crate) data: String
+    pub(crate) data: String,
 }
-
 
 #[derive(Default, Deserialize)]
 pub struct Firehose {
     pub(crate) message: Option<String>,
     pub(crate) records: Option<Vec<FirehoseData>>,
-    #[serde(rename="requestId")]
+    #[serde(rename = "requestId")]
     pub(crate) request_id: Option<String>,
     pub(crate) source_arn: Option<String>,
     pub(crate) source_type: Option<String>,
@@ -66,20 +65,21 @@ pub enum MetricUnit {
     Average,
     Milliseconds,
     Microseconds,
-    #[serde(rename="Count/Second")]
+    #[serde(rename = "Count/Second")]
     CountPerSecond,
-    #[serde(rename="Bytes/Second")]
+    #[serde(rename = "Bytes/Second")]
     BytesPerSecond,
-    None
+    None,
 }
 
 impl DimensionMap {
     pub fn to_kv(&self) -> String {
         let mut dims: Vec<String> = vec![];
         for (k, v) in self.0.iter() {
-            dims.push(format!("{k}->{v}"));
+            //dims.push(format!("{k}={v}"));
         }
-        let d = dims.join(".");
+        //let d = dims.join(".");
+        let d = dims.join(",");
         trace!("to_kv: {d}");
         d
     }

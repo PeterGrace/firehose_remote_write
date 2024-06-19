@@ -11,7 +11,7 @@ default: build image
 build:
   cross build --release --target x86_64-unknown-linux-gnu
 
-image:
+image: build
   docker buildx build --push --platform linux/amd64 \
   -t {{registry}}/{{image}}:latest \
   -t {{registry}}/{{image}}:{{shortcommit}} \
@@ -26,3 +26,8 @@ release-minor:
 release-major:
   cargo release --no-publish --no-verify major --execute
 
+tpconnect:
+ telepresence connect && telepresence intercept firehose-remote-write --port 3000:3000
+
+tpleave:
+ telepresence leave firehose-remote-write && telepresence uninstall --agent firehose-remote-write
