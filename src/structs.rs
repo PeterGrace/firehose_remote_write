@@ -4,10 +4,18 @@ use std::sync::Arc;
 use strum::Display;
 use tokio::sync::RwLock;
 use tracing_subscriber::registry::Data;
+use convert_case::{Case, Casing};
 
 pub type SharedState = Arc<RwLock<AppState>>;
 #[derive(Default, Debug, Deserialize, Clone)]
 pub struct DimensionMap(HashMap<String, String>);
+
+#[derive(Default, Debug, Deserialize, Clone)]
+pub struct LabelsValues {
+    pub key: String,
+    pub value: String
+}
+
 #[derive(Default)]
 pub struct AppState {
     // leaving this unimplemented for now
@@ -84,4 +92,19 @@ impl DimensionMap {
         trace!("to_kv: {d}");
         d
     }
+    pub fn to_labels_values(&self) -> Vec<LabelsValues> {
+            let mut response: Vec<LabelsValues> = vec![];
+            for (k,value) in self.0.clone() {
+                let mut key = k.to_case(Case::Snake);
+                match key.as_str() {
+                    "region" => key = String::from("dimension_region"),
+                    _ => {}
+                }
+                let kv = LabelsValues{key,value};
+                response.push(kv);
+            };
+
+            response
+        }
+
 }

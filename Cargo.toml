@@ -20,3 +20,6 @@ strum = { version = "0.26.2", features = ["derive", "strum_macros"] }
 prometheus = { git = "https://github.com/PeterGrace/rust-prometheus" }
 prometheus_remote_write ={ git = "https://github.com/PeterGrace/prom-write.git" }
 base64 = "0.22.1"
+convert_case = "0.6.0"
+aws-sdk-cloudwatch = "1.40.0"
+aws-config = "1.5.4"
