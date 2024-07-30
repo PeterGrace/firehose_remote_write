@@ -2,7 +2,7 @@ use crate::consts::PROM_NAMESPACE;
 use crate::structs::{CloudWatchMetric, MetricUnit};
 use axum::http::StatusCode;
 use lazy_static::lazy_static;
-use prometheus::core::Metric;
+use prometheus::core::{Collector, Metric};
 use prometheus::{labels, opts, register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec, Gauge, GaugeVec, HistogramVec, TextEncoder, Error};
 use prometheus_remote_write::WriteRequest;
 use reqwest::Client;
@@ -159,7 +159,7 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
         | MetricUnit::Microseconds
         | MetricUnit::None => {
             let mut recorder = GAUGES.lock().await;
-            let outgoing_gauge: GaugeVec = match recorder.get(&incoming_metric.metric_name) {
+            let outgoing_gauge: GaugeVec = match recorder.get(&metric_name) {
                 None => {
                     let gv = register_gauge_vec!(
                         app_opts!(
@@ -169,10 +169,13 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
                         &ordered_labels
                     )
                         .unwrap();
-                    recorder.insert(incoming_metric.metric_name.clone(), gv.clone());
+                    recorder.insert(metric_name.clone(), gv.clone());
                     gv
                 }
-                Some(m) => m.clone(),
+                Some(m) => {
+                    debug!("{metric_name} is {:#?}",m.desc());
+                    m.clone()
+                },
             };
 
             if incoming_metric.value.max.is_some() {
