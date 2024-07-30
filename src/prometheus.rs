@@ -3,10 +3,7 @@ use crate::structs::{CloudWatchMetric, MetricUnit};
 use axum::http::StatusCode;
 use lazy_static::lazy_static;
 use prometheus::core::Metric;
-use prometheus::{
-    labels, opts, register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec,
-    Gauge, GaugeVec, HistogramVec, TextEncoder,
-};
+use prometheus::{labels, opts, register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec, Gauge, GaugeVec, HistogramVec, TextEncoder, Error};
 use prometheus_remote_write::WriteRequest;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -16,7 +13,7 @@ use convert_case::{Case, Casing};
 use tokio::sync::Mutex;
 use url::Url;
 use std::collections::BTreeMap;
-use crate::aws::AWSState;
+use crate::aws::{AWSState, get_dimensions};
 
 macro_rules! app_opts {
     ($a:expr, $b:expr) => {
@@ -33,10 +30,13 @@ type GaugeHash = Arc<Mutex<HashMap<String, GaugeVec>>>;
 type CounterHash = Arc<Mutex<HashMap<String, CounterVec>>>;
 type HistoHash = Arc<Mutex<HashMap<String, HistogramVec>>>;
 
+type DimensionHash = Arc<Mutex<HashMap<String, Vec<String>>>>;
+
 lazy_static! {
     pub static ref GAUGES: GaugeHash = Arc::new(Mutex::new(HashMap::new()));
     pub static ref COUNTERS: CounterHash = Arc::new(Mutex::new(HashMap::new()));
     pub static ref HISTOGRAMS: HistoHash = Arc::new(Mutex::new(HashMap::new()));
+    pub static ref DIMENSION_HASH: DimensionHash = Arc::new(Mutex::new(HashMap::new()));
     pub static ref APP_INFO: GaugeVec = register_gauge_vec!(
         app_opts!(
             "firehose_app_info",
@@ -135,28 +135,11 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
 
     let dims = incoming_metric.dimensions.to_labels_values();
     let mut labels: Vec<&str> = vec!["metric_stream_name", "account_id", "region", "measurement"];
-    let aws = AWSState::initialize(incoming_metric.region.clone()).await;
-    let metric_list = aws.cloudwatch.list_metrics()
-        .namespace(incoming_metric.namespace.clone())
-        .metric_name(incoming_metric.metric_name.clone())
-        .send().await.unwrap();
-    let mut dim_strs: Vec<String> = vec![];
-    for metric in metric_list.metrics().iter() {
-        for dim in metric.dimensions().iter() {
-            let mut key = dim.clone().name.unwrap().to_case(Case::Snake);
-            match key.as_str() {
-                "region" => key = String::from("dimension_region"),
-                _ => {}
-            };
-            dim_strs.push(key);
-        }
-    }
-    dim_strs.sort();
-    dim_strs.dedup();
+    let dim_strs = get_dimensions(incoming_metric.region.clone(),incoming_metric.namespace.clone(),incoming_metric.metric_name.clone()).await;
     labels.extend(dim_strs.iter().map(|s| { s.as_str() }));
     let mut lv_tree: BTreeMap<&str, &str> = BTreeMap::new();
     for label in labels.iter() {
-        lv_tree.insert(label, "");
+        lv_tree.insert(label, "none");
     }
     lv_tree.insert("metric_stream_name", incoming_metric.metric_stream_name.as_str());
     lv_tree.insert("account_id", incoming_metric.account_id.as_str());
@@ -199,7 +182,21 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
                     local_lv_tree.insert(dim.key.as_str(), dim.value.as_str());
                 }
                 let ordered_values: Vec<&str> = local_lv_tree.iter().map(|(k, v)| *v).collect();
-                let m = outgoing_gauge.with_label_values(&ordered_values);
+                let m = match outgoing_gauge.get_metric_with_label_values(&ordered_values) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        match e {
+                            Error::AlreadyReg => {}
+                            Error::InconsistentCardinality { .. } => {
+                                warn!("{metric_name} inconsistent cardinality\n labels: {ordered_labels:#?}\nvalues: {ordered_values:#?}");
+                            }
+                            Error::Msg(_) => {}
+                            Error::Io(_) => {}
+                            Error::Protobuf(_) => {}
+                        }
+                        return Err(anyhow!(e));
+                    }
+                };
                 m.set_timestamp_ms(incoming_metric.timestamp as i64);
                 m.set(incoming_metric.value.max.unwrap() as f64);
             }

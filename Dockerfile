@@ -1,6 +1,7 @@
 FROM ubuntu:24.04
 ARG TARGETARCH
 
+RUN apt-get -y update && apt-get -y install ca-certificates
 RUN mkdir -p /opt/app
 WORKDIR /opt/app
 COPY ./tools/target_arch.sh /opt/app/
