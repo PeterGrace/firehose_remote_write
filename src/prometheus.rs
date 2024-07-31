@@ -139,7 +139,7 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
     labels.extend(dim_strs.iter().map(|s| { s.as_str() }));
     let mut lv_tree: BTreeMap<&str, &str> = BTreeMap::new();
     for label in labels.iter() {
-        lv_tree.insert(label, "none");
+        lv_tree.insert(label, "");
     }
     lv_tree.insert("metric_stream_name", incoming_metric.metric_stream_name.as_str());
     lv_tree.insert("account_id", incoming_metric.account_id.as_str());
