@@ -31,3 +31,6 @@ tpconnect:
 
 tpleave:
  telepresence leave firehose-remote-write && telepresence uninstall --agent firehose-remote-write
+
+run:
+  PROM_WRITE_ADDR=http://172.21.32.20:9090 RUST_LOG=info cargo run
