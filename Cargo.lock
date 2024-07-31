@@ -681,7 +681,7 @@ checksum = "9fc0510504f03c51ada170672ac806f1f105a88aa97a5281117e1ddc3368e51a"
 
 [[package]]
 name = "firehose_remote_write"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "aws-config",
