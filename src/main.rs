@@ -31,11 +31,10 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
-    if let Err(_) = env::var("RUST_LOG") {
-        env::set_var("RUST_LOG", "info");
-    }
+    let filter_layer =
+        EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info")).unwrap();
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(filter_layer)
         .with_file(true)
         .with_line_number(true)
         .init();

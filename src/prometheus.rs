@@ -90,11 +90,20 @@ pub async fn push_firehose_metrics() -> anyhow::Result<bool> {
                 debug!("One or more samples in this push were duplicated or out-of-order.  Not much we can do about this.")
             }
             _ => {
+                // 2024-11-01: if we don't clear the collectors, the daemon just keeps sending the bad data every
+                // attempt
+                clear_collectors().await;
+
                 bail!("400 Bad request: {text}")
             }
         };
     }
-    // now that we've sent them, lets delete them so that they don't pollute future samples
+    // now that we've sent the metrics, lets delete them so that they don't pollute future samples
+    clear_collectors().await;
+    Ok(true)
+}
+
+pub async fn clear_collectors() {
     let mut collectors = GAUGES.lock().await;
     for (key, collector) in collectors.iter() {
         if let Err(e) = prometheus::unregister(Box::new(collector.clone())) {
@@ -116,7 +125,6 @@ pub async fn push_firehose_metrics() -> anyhow::Result<bool> {
         }
     }
     collectors.clear();
-    Ok(true)
 }
 
 pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<()> {
