@@ -107,7 +107,7 @@ async fn get_firehose(
     STREAMS_RECEIVED.with_label_values(&[]).inc();
     match push_firehose_metrics().await {
         Ok(_) => {
-            debug!("succeeded on push")
+            info!("succeeded on push")
         }
         Err(e) => {
             error!("Failed to push metrics: {e}");
