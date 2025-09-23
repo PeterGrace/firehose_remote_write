@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Serialize,Deserialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use strum::Display;
@@ -24,6 +24,10 @@ pub struct AppState {
 #[derive(Default, Deserialize)]
 pub struct FirehoseData {
     pub(crate) data: String,
+}
+#[derive(Default, Serialize)]
+pub struct FirehoseResponse {
+    pub(crate) message: String,
 }
 
 #[derive(Default, Deserialize)]

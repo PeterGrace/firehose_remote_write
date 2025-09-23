@@ -10,7 +10,7 @@ extern crate anyhow;
 
 use std::error::Error;
 use crate::prometheus::{push_firehose_metrics, record_metric, STREAMS_RECEIVED};
-use crate::structs::{AppState, FirehoseData};
+use crate::structs::{AppState, FirehoseData, FirehoseResponse};
 use crate::structs::SharedState;
 use crate::structs::{CloudWatchMetric, Firehose, MetricUnit, MetricValue};
 use ::prometheus::core::Metric;
@@ -79,7 +79,7 @@ async fn get_firehose(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Json(payload): Json<Firehose>,
-) -> Result<String, StatusCode> {
+) -> Result<Json<FirehoseResponse>, StatusCode> {
     let mut payload_message: String = String::from("");
 
     if let Some(records) = payload.records {
@@ -113,7 +113,9 @@ async fn get_firehose(
             error!("Failed to push metrics: {e}");
         }
     }
-    Ok("".to_string())
+    Ok(Json(FirehoseResponse {
+        message: "ok".to_string()
+    }))
 }
 #[cfg(test)]
 use std::fs::File;
