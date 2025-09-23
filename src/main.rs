@@ -28,6 +28,7 @@ use std::time::Duration;
 use base64::decode;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
+use tokio::time::Instant;
 
 #[tokio::main]
 async fn main() {
@@ -79,7 +80,7 @@ async fn get_firehose(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Json(payload): Json<Firehose>,
-) -> Result<Json<FirehoseResponse>, StatusCode> {
+) -> Result<Json<FirehoseResponse>, (StatusCode, Json<FirehoseResponse>)> {
     let mut payload_message: String = String::from("");
 
     if let Some(records) = payload.records {
@@ -107,20 +108,28 @@ async fn get_firehose(
     STREAMS_RECEIVED.with_label_values(&[]).inc();
     match push_firehose_metrics().await {
         Ok(_) => {
-            info!("succeeded on push")
+            info!("succeeded on push");
+            Ok(Json(FirehoseResponse {
+                request_id: payload.request_id.unwrap(),
+                timestamp: Instant::now().elapsed().as_secs(),
+                error_message: None
+            }))
         }
         Err(e) => {
-            error!("Failed to push metrics: {e}");
+            let msg = format!("Failed to push metrics: {e}");
+            error!(msg);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(FirehoseResponse {
+                request_id: payload.request_id.unwrap(),
+                timestamp: Instant::now().elapsed().as_secs(),
+                error_message: Some(msg)
+            })))
         }
     }
-    Ok(Json(FirehoseResponse {
-        message: "ok".to_string()
-    }))
 }
 #[cfg(test)]
 use std::fs::File;
 use std::io::Read;
-
+use tokio::time;
 
 #[tokio::test]
 async fn test_convert_to_labels_values() {

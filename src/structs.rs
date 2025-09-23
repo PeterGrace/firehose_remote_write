@@ -27,7 +27,11 @@ pub struct FirehoseData {
 }
 #[derive(Default, Serialize)]
 pub struct FirehoseResponse {
-    pub(crate) message: String,
+    #[serde(rename = "requestId")]
+    pub(crate) request_id: String,
+    pub(crate) timestamp: u64,
+    #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
+    pub(crate) error_message: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
