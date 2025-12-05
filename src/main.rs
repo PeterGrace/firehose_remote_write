@@ -60,6 +60,7 @@ async fn main() {
             let firehose_arns = shared_state.read().await.firehose_arns.clone();
             for firehose_arn in firehose_arns.iter() {
                 let freshness = get_freshness(firehose_arn.clone()).await.unwrap();
+                info!("Freshness for {firehose_arn}: {freshness}");
                 FRESHNESS_INFO
                     .with_label_values(&[firehose_arn])
                     .set(freshness);
