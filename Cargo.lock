@@ -859,6 +859,7 @@ dependencies = [
  "aws-arn",
  "aws-config",
  "aws-sdk-cloudwatch",
+ "aws-smithy-types",
  "axum",
  "base64 0.22.1",
  "cached",

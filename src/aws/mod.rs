@@ -3,11 +3,11 @@ use aws_arn::ResourceName;
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
 use aws_config::Region;
-use aws_sdk_cloudwatch::types::{Dimension, DimensionFilter};
+use aws_sdk_cloudwatch::types::{Dimension, DimensionFilter, MetricDataQuery, MetricStat};
 use cached::proc_macro::cached;
 use convert_case::{Case, Casing};
 use std::collections::HashMap;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct AWSState {
@@ -87,11 +87,32 @@ pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
             .await
             .unwrap();
         for metric in metric_list.metrics().iter() {
-            for dim in metric.dimensions().iter() {
-                let dim = dim.clone();
-                if dim.name.unwrap() == "DeliveryToHttpEndpoint.DeliveryStreamArn" {
-                    return Ok(dim.value.unwrap().parse::<f64>()?);
-                }
+            let dt_now = aws_smithy_types::DateTime::from_secs(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs() as i64
+            );
+            let dt_one_min_ago = aws_smithy_types::DateTime::from_secs(
+                (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs() - 60) as i64
+            );
+
+            let metric_stat = MetricStat::builder().metric(metric.clone()).period(60).stat("Maximum").build();
+            let metric_query = MetricDataQuery::builder()
+                .id("m1")
+                .metric_stat(metric_stat)
+                .return_data(true)
+                .build();
+            let response = aws.cloudwatch.get_metric_data()
+                .start_time(dt_one_min_ago)
+                .end_time(dt_now)
+                .metric_data_queries(metric_query)
+                .send()
+                .await?;
+            debug!("response: {response:#?}");
+            if response.metric_data_results().len() > 0 {
+                return Ok(response.metric_data_results()[0].values()[0])
             }
         }
         let msg = format!("Can't find freshness metric for {firehose_stream_arn} dims {:#?}, metriclist is {:#?}", dims, metric_list);
