@@ -20,7 +20,7 @@ pub struct LabelsValues {
 pub struct AppState {
     pub(crate) firehose_arns: HashSet<String>,
 }
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Debug)]
 pub struct FirehoseData {
     pub(crate) data: String,
 }
@@ -33,7 +33,7 @@ pub struct FirehoseResponse {
     pub(crate) error_message: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Debug)]
 pub struct Firehose {
     pub(crate) message: Option<String>,
     pub(crate) records: Option<Vec<FirehoseData>>,
