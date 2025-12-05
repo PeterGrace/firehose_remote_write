@@ -73,7 +73,7 @@ pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
         let mut dims: Vec<DimensionFilter> = vec![];
         dims.push(
             DimensionFilter::builder()
-                .name("DeliveryToHttpEndpoint.DeliveryStreamName")
+                .name("DeliveryStreamName")
                 .value(arn.resource.to_string().split("/").last().unwrap().to_string())
                 .build(),
         );
