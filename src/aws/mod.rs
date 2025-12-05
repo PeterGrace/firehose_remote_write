@@ -12,7 +12,6 @@ use tokio::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub struct AWSState {
     pub(crate) cloudwatch: aws_sdk_cloudwatch::Client,
-    pub(crate) freshness: HashMap<String, i64>,
 }
 
 impl AWSState {
@@ -24,7 +23,6 @@ impl AWSState {
         let cloudwatch = aws_sdk_cloudwatch::Client::new(&aws_config.clone());
         AWSState {
             cloudwatch,
-            freshness: HashMap::new(),
         }
     }
 }
