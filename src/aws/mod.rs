@@ -82,7 +82,7 @@ pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
             .list_metrics()
             .namespace(String::from("AWS/Firehose"))
             .metric_name(String::from("DeliveryToHttpEndpoint.DataFreshness"))
-            .set_dimensions(Some(dims))
+            .set_dimensions(Some(dims.clone()))
             .send()
             .await
             .unwrap();
@@ -94,8 +94,10 @@ pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
                 }
             }
         }
+        let msg = format!("Can't find freshness metric for {firehose_stream_arn} dims {:#?}, metriclist is {:#?}", dims, metric_list);
+        error!(msg);
         Err(anyhow!(
-            "Can't find freshness metric for {firehose_stream_arn}"
+            msg
         ))
     } else {
         Err(anyhow!("Can't parse region from arn"))
