@@ -73,8 +73,8 @@ pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
         let mut dims: Vec<DimensionFilter> = vec![];
         dims.push(
             DimensionFilter::builder()
-                .name("DeliveryToHttpEndpoint.DeliveryStreamArn")
-                .value(&firehose_stream_arn)
+                .name("DeliveryToHttpEndpoint.DeliveryStreamName")
+                .value(arn.resource.to_string().split("/").last().unwrap().to_string())
                 .build(),
         );
         let metric_list = aws
