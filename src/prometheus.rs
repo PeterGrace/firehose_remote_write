@@ -50,7 +50,7 @@ lazy_static! {
     .unwrap();
     pub static ref FRESHNESS_INFO: GaugeVec = register_gauge_vec!(
         app_opts!(
-            "firehose_queue_freshness_seconds",
+            "queue_freshness_seconds",
             "The maximum age of currently enqueued records in the firehose queue, in seconds"
         ),
         &["queue_arn"]
