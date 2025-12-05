@@ -102,7 +102,7 @@ async fn get_firehose(
     Json(payload): Json<Firehose>,
 ) -> Result<Json<FirehoseResponse>, (StatusCode, Json<FirehoseResponse>)> {
     let mut payload_message: String = String::from("");
-    info!("{:#?}", payload);
+
 
     if let Some(firehose) = payload.source_arn {
         state.write().await.firehose_arns.insert(firehose);

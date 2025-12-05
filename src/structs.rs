@@ -20,7 +20,7 @@ pub struct LabelsValues {
 pub struct AppState {
     pub(crate) firehose_arns: HashSet<String>,
 }
-#[derive(Default, Deserialize, Debug)]
+#[derive(Default, Deserialize, Debugc)]
 pub struct FirehoseData {
     pub(crate) data: String,
 }
