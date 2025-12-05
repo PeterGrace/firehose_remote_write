@@ -1,12 +1,18 @@
-use aws_config::Region;
+use crate::prometheus::DIMENSION_HASH;
+use aws_arn::ResourceName;
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
+use aws_config::Region;
+use aws_sdk_cloudwatch::types::{Dimension, DimensionFilter};
+use cached::proc_macro::cached;
 use convert_case::{Case, Casing};
-use crate::prometheus::DIMENSION_HASH;
+use std::collections::HashMap;
+use tokio::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct AWSState {
-    pub(crate) cloudwatch: aws_sdk_cloudwatch::Client
+    pub(crate) cloudwatch: aws_sdk_cloudwatch::Client,
+    pub(crate) freshness: HashMap<String, i64>,
 }
 
 impl AWSState {
@@ -17,7 +23,8 @@ impl AWSState {
             .await;
         let cloudwatch = aws_sdk_cloudwatch::Client::new(&aws_config.clone());
         AWSState {
-            cloudwatch
+            cloudwatch,
+            freshness: HashMap::new(),
         }
     }
 }
@@ -27,10 +34,14 @@ pub async fn get_dimensions(region: String, namespace: String, metric: String) -
     match dim.get(&cache_key) {
         None => {
             let aws = AWSState::initialize(region.clone()).await;
-            let metric_list = aws.cloudwatch.list_metrics()
+            let metric_list = aws
+                .cloudwatch
+                .list_metrics()
                 .namespace(namespace.clone())
                 .metric_name(metric.clone())
-                .send().await.unwrap();
+                .send()
+                .await
+                .unwrap();
             let mut dim_strs: Vec<String> = vec![];
             for metric in metric_list.metrics().iter() {
                 for dim in metric.dimensions().iter() {
@@ -44,13 +55,49 @@ pub async fn get_dimensions(region: String, namespace: String, metric: String) -
             }
             dim_strs.sort();
             dim_strs.dedup();
-            dim.insert(cache_key.clone(),dim_strs.clone());
+            dim.insert(cache_key.clone(), dim_strs.clone());
             debug!("CREATED {cache_key}");
             return dim_strs;
         }
         Some(s) => {
             debug!("found {cache_key}");
-            return s.clone();}
+            return s.clone();
+        }
     }
-
+}
+#[cached(time = 60, result = true)]
+pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
+    let arn: ResourceName = firehose_stream_arn.parse()?;
+    if let Some(region) = arn.region {
+        let aws = AWSState::initialize(region.to_string()).await;
+        let mut dims: Vec<DimensionFilter> = vec![];
+        dims.push(
+            DimensionFilter::builder()
+                .name("DeliveryToHttpEndpoint.DeliveryStreamArn")
+                .value(&firehose_stream_arn)
+                .build(),
+        );
+        let metric_list = aws
+            .cloudwatch
+            .list_metrics()
+            .namespace(String::from("AWS/Firehose"))
+            .metric_name(String::from("DeliveryToHttpEndpoint.DataFreshness"))
+            .set_dimensions(Some(dims))
+            .send()
+            .await
+            .unwrap();
+        for metric in metric_list.metrics().iter() {
+            for dim in metric.dimensions().iter() {
+                let dim = dim.clone();
+                if dim.name.unwrap() == "DeliveryToHttpEndpoint.DeliveryStreamArn" {
+                    return Ok(dim.value.unwrap().parse::<f64>()?);
+                }
+            }
+        }
+        Err(anyhow!(
+            "Can't find freshness metric for {firehose_stream_arn}"
+        ))
+    } else {
+        Err(anyhow!("Can't parse region from arn"))
+    }
 }
