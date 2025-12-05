@@ -103,10 +103,15 @@ async fn get_firehose(
 ) -> Result<Json<FirehoseResponse>, (StatusCode, Json<FirehoseResponse>)> {
     let mut payload_message: String = String::from("");
 
+    if let Some(source_arn) = headers.get("X-Amz-Firehose-Source-Arn") {
+        state.write().await.firehose_arns.insert(source_arn.to_str().unwrap().to_string());
 
-    if let Some(firehose) = payload.source_arn {
+    } else if let Some(firehose) = payload.source_arn {
         state.write().await.firehose_arns.insert(firehose);
+    } else {
+        warn!("Could not find source arn in headers or payload for this request.")
     }
+    
     if let Some(records) = payload.records {
         // although it's not beyond belief that amazon would send us malformed b64, it's unlikely,
         // so I'm skipping error processing here for now
