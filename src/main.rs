@@ -144,24 +144,38 @@ async fn get_firehose(
                     .as_secs() as u64,
                 error_message: None,
             };
-            info!("succeeded on push: {response:#?}");
+            debug!("succeeded on push: {response:#?}");
             Ok(Json(response))
         }
         Err(e) => {
-            let msg = format!("Failed to push metrics: {e}");
-            let response = FirehoseResponse {
-                request_id: payload.request_id.unwrap(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as u64,
-                error_message: Some(msg),
-            };
-            error!("{response:#?}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(response),
-            ))
+            if e.to_string().contains("too old sample") {
+                let response = FirehoseResponse {
+                    request_id: payload.request_id.unwrap(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as u64,
+                    error_message: None,
+                };
+                warn!("Received old samples, still telling AWS we're ok to proceed{response:#?}");
+                Ok(Json(response))
+            } else {
+                let msg = format!("Failed to push metrics: {e}");
+                let response = FirehoseResponse {
+                    request_id: payload.request_id.unwrap(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as u64,
+                    error_message: Some(msg),
+                };
+                error!("{response:#?}");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(response),
+                ))
+
+            }
         }
     }
 }
