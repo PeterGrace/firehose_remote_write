@@ -53,8 +53,9 @@ async fn main() {
         .with_state(Arc::clone(&shared_state));
 
     tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(60));
+        let mut interval = interval(Duration::from_secs(15));
         loop {
+            println!("Running scheduled task");
             interval.tick().await;
             // Check discovered firehose arns and check their freshness
             let firehose_arns = shared_state.read().await.firehose_arns.clone();
@@ -66,7 +67,8 @@ async fn main() {
                     .set(freshness);
             }
 
-            println!("Running scheduled task");
+            // push to prometheus remote write
+            let _ = push_firehose_metrics().await;
         }
     });
 
@@ -134,28 +136,11 @@ async fn get_firehose(
         }
     }
     STREAMS_RECEIVED.with_label_values(&[]).inc();
-    match push_firehose_metrics().await {
-        Ok(_) => {
-            info!("succeeded on push");
-            Ok(Json(FirehoseResponse {
-                request_id: payload.request_id.unwrap(),
-                timestamp: Instant::now().elapsed().as_secs(),
-                error_message: None,
-            }))
-        }
-        Err(e) => {
-            let msg = format!("Failed to push metrics: {e}");
-            error!(msg);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(FirehoseResponse {
-                    request_id: payload.request_id.unwrap(),
-                    timestamp: Instant::now().elapsed().as_secs(),
-                    error_message: Some(msg),
-                }),
-            ))
-        }
-    }
+    Ok(Json(FirehoseResponse {
+        request_id: payload.request_id.unwrap(),
+        timestamp: Instant::now().elapsed().as_secs(),
+        error_message: None,
+    }))
 }
 use crate::aws::AWSState;
 #[cfg(test)]
