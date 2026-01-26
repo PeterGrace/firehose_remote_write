@@ -113,6 +113,9 @@ pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
                 let rs = response.metric_data_results()[0].values();
                 if rs.len() > 0 {
                     return Ok(rs[0])
+                } else {
+                    error!("Received no values for freshness metric; {rs:#?}");
+                    return(Ok(0.0))
                 }
             }
         }
