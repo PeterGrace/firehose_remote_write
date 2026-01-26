@@ -110,7 +110,10 @@ pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
                 .await?;
             debug!("response: {response:#?}");
             if response.metric_data_results().len() > 0 {
-                return Ok(response.metric_data_results()[0].values()[0])
+                let rs = response.metric_data_results()[0].values();
+                if rs.len() > 0 {
+                    return Ok(rs[0])
+                }
             }
         }
         let msg = format!("Can't find freshness metric for {firehose_stream_arn} dims {:#?}, metriclist is {:#?}", dims, metric_list);
