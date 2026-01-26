@@ -139,11 +139,13 @@ async fn get_firehose(
         }
     }
     STREAMS_RECEIVED.with_label_values(&[]).inc();
-    Ok(Json(FirehoseResponse {
+    let response = FirehoseResponse {
         request_id: payload.request_id.unwrap(),
         timestamp: Instant::now().elapsed().as_secs(),
         error_message: None,
-    }))
+    };
+    info!("{response:#?}");
+    Ok(Json(response))
 }
 use crate::aws::AWSState;
 #[cfg(test)]

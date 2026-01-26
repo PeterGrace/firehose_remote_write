@@ -25,6 +25,7 @@ pub struct FirehoseData {
     pub(crate) data: String,
 }
 #[derive(Default, Serialize)]
+#[derive(Debug)]
 pub struct FirehoseResponse {
     #[serde(rename = "requestId")]
     pub(crate) request_id: String,
