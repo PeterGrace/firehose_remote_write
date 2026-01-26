@@ -53,9 +53,8 @@ async fn main() {
         .with_state(Arc::clone(&shared_state));
 
     tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(15));
+        let mut interval = interval(Duration::from_secs(60));
         loop {
-            println!("Running scheduled task");
             interval.tick().await;
             // Check discovered firehose arns and check their freshness
             let firehose_arns = shared_state.read().await.firehose_arns.clone();
@@ -67,11 +66,7 @@ async fn main() {
                     .set(freshness);
             }
 
-            // push to prometheus remote write
-            match push_firehose_metrics().await {
-                Ok(_) => info!("Pushed metrics to prometheus"),
-                Err(e) => error!("Couldn't push metrics to prometheus: {e}"),
-            }
+            println!("Running scheduled task");
         }
     });
 
@@ -139,16 +134,36 @@ async fn get_firehose(
         }
     }
     STREAMS_RECEIVED.with_label_values(&[]).inc();
-    let response = FirehoseResponse {
-        request_id: payload.request_id.unwrap(),
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as u64,
-        error_message: None,
-    };
-    info!("{response:#?}");
-    Ok(Json(response))
+    match push_firehose_metrics().await {
+        Ok(_) => {
+            let response = FirehoseResponse {
+                request_id: payload.request_id.unwrap(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as u64,
+                error_message: None,
+            };
+            info!("succeeded on push: {response:#?}");
+            Ok(Json(response))
+        }
+        Err(e) => {
+            let msg = format!("Failed to push metrics: {e}");
+            let response = FirehoseResponse {
+                request_id: payload.request_id.unwrap(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as u64,
+                error_message: Some(msg),
+            };
+            error!("{response:#?}");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(response),
+            ))
+        }
+    }
 }
 use crate::aws::AWSState;
 #[cfg(test)]
