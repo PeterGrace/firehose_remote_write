@@ -68,7 +68,10 @@ async fn main() {
             }
 
             // push to prometheus remote write
-            let _ = push_firehose_metrics().await;
+            match push_firehose_metrics().await {
+                Ok(_) => info!("Pushed metrics to prometheus"),
+                Err(e) => error!("Couldn't push metrics to prometheus: {e}"),
+            }
         }
     });
 
