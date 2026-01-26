@@ -1,19 +1,22 @@
+use crate::aws::{get_dimensions, AWSState};
 use crate::consts::PROM_NAMESPACE;
 use crate::structs::{CloudWatchMetric, MetricUnit};
 use axum::http::StatusCode;
+use convert_case::{Case, Casing};
 use lazy_static::lazy_static;
 use prometheus::core::{Collector, Metric};
-use prometheus::{labels, opts, register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec, Gauge, GaugeVec, HistogramVec, TextEncoder, Error};
+use prometheus::{
+    labels, opts, register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec,
+    Error, Gauge, GaugeVec, HistogramVec, TextEncoder,
+};
 use prometheus_remote_write::WriteRequest;
 use reqwest::Client;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use convert_case::{Case, Casing};
 use tokio::sync::Mutex;
 use url::Url;
-use std::collections::BTreeMap;
-use crate::aws::{AWSState, get_dimensions};
 
 macro_rules! app_opts {
     ($a:expr, $b:expr) => {
@@ -43,6 +46,14 @@ lazy_static! {
             "static app labels that potentially only change at restart"
         ),
         &["crate_version", "git_hash"]
+    )
+    .unwrap();
+    pub static ref FRESHNESS_INFO: GaugeVec = register_gauge_vec!(
+        app_opts!(
+            "queue_freshness_seconds",
+            "The maximum age of currently enqueued records in the firehose queue, in seconds"
+        ),
+        &["queue_arn"]
     )
     .unwrap();
     pub static ref STREAMS_RECEIVED: CounterVec = register_counter_vec!(
@@ -143,17 +154,25 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
 
     let dims = incoming_metric.dimensions.to_labels_values();
     let mut labels: Vec<&str> = vec!["metric_stream_name", "account_id", "region"];
-    let dim_strs = get_dimensions(incoming_metric.region.clone(),incoming_metric.namespace.clone(),incoming_metric.metric_name.clone()).await;
-    labels.extend(dim_strs.iter().map(|s| { s.as_str() }));
+    let dim_strs = get_dimensions(
+        incoming_metric.region.clone(),
+        incoming_metric.namespace.clone(),
+        incoming_metric.metric_name.clone(),
+    )
+    .await;
+    labels.extend(dim_strs.iter().map(|s| s.as_str()));
     let mut lv_tree: BTreeMap<&str, &str> = BTreeMap::new();
     for label in labels.iter() {
         lv_tree.insert(label, "");
     }
-    lv_tree.insert("metric_stream_name", incoming_metric.metric_stream_name.as_str());
+    lv_tree.insert(
+        "metric_stream_name",
+        incoming_metric.metric_stream_name.as_str(),
+    );
     lv_tree.insert("account_id", incoming_metric.account_id.as_str());
     lv_tree.insert("region", incoming_metric.region.as_str());
 
-    let ordered_labels: Vec<&str> =lv_tree.iter().map(|(k, v)| *k).collect();
+    let ordered_labels: Vec<&str> = lv_tree.iter().map(|(k, v)| *k).collect();
 
     match incoming_metric.unit {
         MetricUnit::Count
@@ -166,7 +185,6 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
         | MetricUnit::Milliseconds
         | MetricUnit::Microseconds
         | MetricUnit::None => {
-
             if incoming_metric.value.max.is_some() {
                 let mut local_lv_tree = lv_tree.clone();
                 for dim in dims.iter() {
@@ -174,7 +192,8 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
                 }
                 let ordered_values: Vec<&str> = local_lv_tree.iter().map(|(k, v)| *v).collect();
                 let full_metric_name = format!("{metric_name}_max");
-                let outgoing_gauge = get_or_register_metric(full_metric_name,&ordered_labels).await;
+                let outgoing_gauge =
+                    get_or_register_metric(full_metric_name, &ordered_labels).await;
                 let m = match outgoing_gauge.get_metric_with_label_values(&ordered_values) {
                     Ok(m) => m,
                     Err(e) => {
@@ -200,7 +219,8 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
                 }
                 let ordered_values: Vec<&str> = local_lv_tree.iter().map(|(k, v)| *v).collect();
                 let full_metric_name = format!("{metric_name}_min");
-                let outgoing_gauge = get_or_register_metric(full_metric_name, &ordered_labels).await;
+                let outgoing_gauge =
+                    get_or_register_metric(full_metric_name, &ordered_labels).await;
 
                 let m = outgoing_gauge.with_label_values(&ordered_values.clone());
                 m.set_timestamp_ms(incoming_metric.timestamp as i64);
@@ -213,7 +233,8 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
                 }
                 let ordered_values: Vec<&str> = local_lv_tree.iter().map(|(k, v)| *v).collect();
                 let full_metric_name = format!("{metric_name}_sum");
-                let outgoing_gauge = get_or_register_metric(full_metric_name, &ordered_labels).await;
+                let outgoing_gauge =
+                    get_or_register_metric(full_metric_name, &ordered_labels).await;
                 let m = outgoing_gauge.with_label_values(&ordered_values.clone());
                 m.set_timestamp_ms(incoming_metric.timestamp as i64);
                 m.set(incoming_metric.value.sum.unwrap() as f64);
@@ -225,7 +246,8 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
                 }
                 let ordered_values: Vec<&str> = local_lv_tree.iter().map(|(k, v)| *v).collect();
                 let full_metric_name = format!("{metric_name}_count");
-                let outgoing_gauge = get_or_register_metric(full_metric_name, &ordered_labels).await;
+                let outgoing_gauge =
+                    get_or_register_metric(full_metric_name, &ordered_labels).await;
                 let m = outgoing_gauge.with_label_values(&ordered_values);
                 m.set_timestamp_ms(incoming_metric.timestamp as i64);
                 m.set(incoming_metric.value.count.unwrap() as f64);
@@ -254,18 +276,13 @@ pub async fn get_or_register_metric(metric_name: String, ordered_labels: &Vec<&s
     match recorder.get(&metric_name) {
         None => {
             let gv = register_gauge_vec!(
-                        app_opts!(
-                            metric_name.clone(),
-                            "autogenerated metric from firehose"
-                        ),
-                        &ordered_labels
-                    )
-                .unwrap();
+                app_opts!(metric_name.clone(), "autogenerated metric from firehose"),
+                &ordered_labels
+            )
+            .unwrap();
             recorder.insert(metric_name.clone(), gv.clone());
             gv
         }
-        Some(m) => {
-            m.clone()
-        }
+        Some(m) => m.clone(),
     }
 }

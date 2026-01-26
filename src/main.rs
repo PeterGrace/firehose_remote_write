@@ -1,17 +1,17 @@
+pub(crate) mod aws;
 mod consts;
 mod prometheus;
 pub(crate) mod structs;
-pub(crate) mod aws;
 
 #[macro_use]
 extern crate tracing;
 #[macro_use]
 extern crate anyhow;
 
-use std::error::Error;
-use crate::prometheus::{push_firehose_metrics, record_metric, STREAMS_RECEIVED};
-use crate::structs::{AppState, FirehoseData, FirehoseResponse};
+use crate::aws::get_freshness;
+use crate::prometheus::{push_firehose_metrics, record_metric, FRESHNESS_INFO, STREAMS_RECEIVED};
 use crate::structs::SharedState;
+use crate::structs::{AppState, FirehoseData, FirehoseResponse};
 use crate::structs::{CloudWatchMetric, Firehose, MetricUnit, MetricValue};
 use ::prometheus::core::Metric;
 use axum::body::Bytes;
@@ -20,20 +20,22 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{debug_handler, extract, Json, Router};
+use base64::decode;
 use base64::prelude::*;
 use serde::Deserialize;
 use std::env;
+use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
-use base64::decode;
 use tokio::sync::RwLock;
+use tokio::time::{interval, Instant};
 use tracing_subscriber::EnvFilter;
-use tokio::time::Instant;
 
 #[tokio::main]
 async fn main() {
-    let filter_layer =
-        EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info")).unwrap();
+    let filter_layer = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new("info"))
+        .unwrap();
     tracing_subscriber::fmt()
         .with_env_filter(filter_layer)
         .with_file(true)
@@ -50,13 +52,31 @@ async fn main() {
         .route("/", post(get_firehose).put(get_firehose))
         .with_state(Arc::clone(&shared_state));
 
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            // Check discovered firehose arns and check their freshness
+            let firehose_arns = shared_state.read().await.firehose_arns.clone();
+            for firehose_arn in firehose_arns.iter() {
+                if let Ok(freshness) = get_freshness(firehose_arn.clone()).await {
+                    info!("Freshness for {firehose_arn}: {freshness}");
+                    FRESHNESS_INFO
+                        .with_label_values(&[firehose_arn])
+                        .set(freshness);
+                }
+            }
+            println!("Running scheduled task");
+        }
+    });
+
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     info!("Spawning axum listener.");
     axum::serve(listener, app).await.unwrap();
     loop {}
 }
 
-async fn decode_payloads(records: Vec<FirehoseData>) -> Result<String,Box<dyn Error>> {
+async fn decode_payloads(records: Vec<FirehoseData>) -> Result<String, Box<dyn Error>> {
     let payload_message = records
         .iter()
         .map(|s| String::from_utf8(BASE64_STANDARD.decode(&s.data).unwrap()).unwrap())
@@ -83,6 +103,15 @@ async fn get_firehose(
 ) -> Result<Json<FirehoseResponse>, (StatusCode, Json<FirehoseResponse>)> {
     let mut payload_message: String = String::from("");
 
+    if let Some(source_arn) = headers.get("X-Amz-Firehose-Source-Arn") {
+        state.write().await.firehose_arns.insert(source_arn.to_str().unwrap().to_string());
+
+    } else if let Some(firehose) = payload.source_arn {
+        state.write().await.firehose_arns.insert(firehose);
+    } else {
+        warn!("Could not find source arn in headers or payload for this request.")
+    }
+    
     if let Some(records) = payload.records {
         // although it's not beyond belief that amazon would send us malformed b64, it's unlikely,
         // so I'm skipping error processing here for now
@@ -103,29 +132,54 @@ async fn get_firehose(
         } else {
             debug!("unable to decode cloudmetric");
         }
-
     }
     STREAMS_RECEIVED.with_label_values(&[]).inc();
     match push_firehose_metrics().await {
         Ok(_) => {
-            info!("succeeded on push");
-            Ok(Json(FirehoseResponse {
+            let response = FirehoseResponse {
                 request_id: payload.request_id.unwrap(),
-                timestamp: Instant::now().elapsed().as_secs(),
-                error_message: None
-            }))
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as u64,
+                error_message: None,
+            };
+            debug!("succeeded on push: {response:#?}");
+            Ok(Json(response))
         }
         Err(e) => {
-            let msg = format!("Failed to push metrics: {e}");
-            error!(msg);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(FirehoseResponse {
-                request_id: payload.request_id.unwrap(),
-                timestamp: Instant::now().elapsed().as_secs(),
-                error_message: Some(msg)
-            })))
+            if e.to_string().contains("too old sample") {
+                let response = FirehoseResponse {
+                    request_id: payload.request_id.unwrap(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as u64,
+                    error_message: None,
+                };
+                warn!("Received old samples, still telling AWS we're ok to proceed{response:#?}");
+                Ok(Json(response))
+            } else {
+                let msg = format!("Failed to push metrics: {e}");
+                let response = FirehoseResponse {
+                    request_id: payload.request_id.unwrap(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as u64,
+                    error_message: Some(msg),
+                };
+                error!("{response:#?}");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(response),
+                ))
+
+            }
         }
     }
 }
+use crate::aws::AWSState;
 #[cfg(test)]
 use std::fs::File;
 use std::io::Read;

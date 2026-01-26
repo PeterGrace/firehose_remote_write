@@ -1,6 +1,6 @@
 [package]
 name = "firehose_remote_write"
-version = "0.7.4"
+version = "0.8.1"
 edition = "2021"
 
 [dependencies]
@@ -21,5 +21,8 @@ prometheus = { git = "https://github.com/PeterGrace/rust-prometheus" }
 prometheus_remote_write ={ git = "https://github.com/PeterGrace/prom-write.git" }
 base64 = "0.22.1"
 convert_case = "0.6.0"
-aws-sdk-cloudwatch = "1.40.0"
-aws-config = "1.5.4"
+aws-sdk-cloudwatch = "1.98.0"
+aws-arn = "0.3.1"
+aws-config = "1.8.11"
+cached = { version = "0.56.0", features = ["async_tokio_rt_multi_thread"] }
+aws-smithy-types = "1.3.4"
