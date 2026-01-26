@@ -141,7 +141,10 @@ async fn get_firehose(
     STREAMS_RECEIVED.with_label_values(&[]).inc();
     let response = FirehoseResponse {
         request_id: payload.request_id.unwrap(),
-        timestamp: Instant::now().elapsed().as_secs(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u64,
         error_message: None,
     };
     info!("{response:#?}");
