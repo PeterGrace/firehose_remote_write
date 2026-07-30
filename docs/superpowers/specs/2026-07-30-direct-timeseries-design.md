@@ -160,8 +160,11 @@ carry no explicit timestamp, so `prometheus_parse::Scrape::parse` stamps them wi
 `Utc::now()` at parse time, and at any real request rate two pushes landed in the same
 millisecond.
 
-`TOTAL_WRITES_SENT` is currently incremented after `gather()` has already run, so it is
-always one push behind. The writer increments it before building the request.
+`TOTAL_WRITES_SENT` is labelled by response status, which is not known until the push has
+completed — after the self-metrics for that flush were already gathered. It is therefore
+inherently one flush behind, and stays that way. This is normal for a "writes sent" counter
+and is not worth contorting the flush order to fix; the value is correct, just observed one
+flush later.
 
 An `instance` label is added, sourced from `HOSTNAME`, falling back to `"unknown"`.
 
