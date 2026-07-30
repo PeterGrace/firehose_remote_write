@@ -236,20 +236,46 @@ Add to `src/series.rs`:
 ```rust
 use convert_case::{Case, Casing};
 
+/// Reserved label names we set ourselves. A dimension normalizing onto any of these
+/// would overwrite our own label — `__name__` worst of all, which would clobber the
+/// metric name — so collisions are prefixed instead.
+const RESERVED_LABELS: [&str; 4] = ["__name__", "metric_stream_name", "account_id", "region"];
+
 /// Normalize a CloudWatch dimension name into a valid Prometheus label name.
 ///
-/// A dimension literally named `region` would collide with the top-level `region`
-/// label taken from the record, so it is prefixed.
-fn label_name_for_dimension(name: &str) -> String {
-    let snake = name.to_case(Case::Snake);
-    let cleaned: String = snake
+/// Unlike metric names, label names get no `firehose_` prefix to make them valid, so
+/// every rule has to be enforced here. A label name must match
+/// `[a-zA-Z_][a-zA-Z0-9_]*` — note a leading digit is invalid, which `5xxCode` hits.
+///
+/// Replacement (not deletion) is used here, matching the legacy `to_case(Case::Snake)`
+/// behaviour. This deliberately differs from `sanitize_metric_name`, which deletes for
+/// byte-parity with legacy metric names. Duplicate label names get the entire write
+/// request rejected, so collisions matter far more here than in a metric name.
+///
+/// Returns `None` when the name cannot be salvaged, so the caller can skip the label
+/// rather than emit an invalid one.
+fn label_name_for_dimension(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .to_case(Case::Snake)
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
         .collect();
-    match cleaned.as_str() {
-        "region" => String::from("dimension_region"),
-        _ => cleaned,
+
+    if cleaned.is_empty() {
+        return None;
     }
+
+    // A leading digit is not a valid label name; prefix rather than drop the dimension.
+    let cleaned = if cleaned.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("d_{cleaned}")
+    } else {
+        cleaned
+    };
+
+    if RESERVED_LABELS.contains(&cleaned.as_str()) {
+        return Some(format!("dimension_{cleaned}"));
+    }
+    Some(cleaned)
 }
 
 /// Build the full label set for one sample, sorted by label name.
@@ -266,20 +292,94 @@ pub fn labels_for(metric: &CloudWatchMetric, full_metric_name: &str) -> Vec<Labe
     ];
 
     for dim in metric.dimensions.to_labels_values() {
-        labels.push(Label {
-            name: label_name_for_dimension(&dim.key),
-            value: dim.value,
-        });
+        let Some(name) = label_name_for_dimension(&dim.key) else {
+            warn!("dropping dimension with unusable name {:?}", dim.key);
+            continue;
+        };
+        labels.push(Label { name, value: dim.value });
     }
 
+    // Sorting is a wire requirement, not a nicety, and `DimensionMap` is a `HashMap` so
+    // iteration order is nondeterministic. Sort first so dedup sees duplicates adjacent.
     labels.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // A duplicate label name gets the ENTIRE write request rejected by the receiver,
+    // killing every good sample batched alongside it. Distinct dimensions can normalize
+    // onto one name (`InstanceId`, `instance_id` and `Instance-Id` all become
+    // `instance_id`), so this is reachable from real input, and because the source is a
+    // HashMap, which one survives is nondeterministic across runs.
     labels.dedup_by(|a, b| a.name == b.name);
+
     labels
 }
 ```
 
 Note: `DimensionMap::to_labels_values` already snake-cases keys and maps `region`;
-`label_name_for_dimension` re-applies both idempotently plus character sanitization.
+`label_name_for_dimension` re-applies both idempotently plus character sanitization,
+leading-digit repair, and the full reserved-name check.
+
+**Add these tests alongside the ones above** — each covers a degenerate case that produces
+either an invalid label name or a batch-killing duplicate:
+
+```rust
+    #[test]
+    fn leading_digit_label_names_are_repaired() {
+        let labels = labels_for(&with_dims(r#"{"5xxCode":"500"}"#), "m");
+        let name = &labels.iter().find(|l| l.value == "500").unwrap().name;
+        assert!(
+            !name.starts_with(|c: char| c.is_ascii_digit()),
+            "leading digit is an invalid Prometheus label name, got {name:?}"
+        );
+    }
+
+    #[test]
+    fn dimensions_colliding_with_reserved_labels_are_prefixed() {
+        let labels = labels_for(&with_dims(r#"{"AccountId":"999"}"#), "m");
+        // Our own account_id must survive untouched.
+        assert!(labels.iter().any(|l| l.name == "account_id" && l.value == "123456789012"));
+        assert!(labels.iter().any(|l| l.name == "dimension_account_id" && l.value == "999"));
+    }
+
+    #[test]
+    fn dimension_named_like_the_name_label_cannot_clobber_the_metric_name() {
+        let labels = labels_for(&with_dims(r#"{"__name__":"evil"}"#), "real_metric_name");
+        assert!(labels.iter().any(|l| l.name == "__name__" && l.value == "real_metric_name"));
+    }
+
+    #[test]
+    fn unusable_dimension_names_are_dropped_not_emitted_empty() {
+        let labels = labels_for(&with_dims(r#"{"!!!":"v"}"#), "m");
+        assert!(labels.iter().all(|l| !l.name.is_empty()));
+        assert!(labels.iter().all(|l| l.value != "v"));
+    }
+
+    #[test]
+    fn label_names_are_unique_after_normalization() {
+        // All three normalize onto `instance_id`; a duplicate on the wire gets the whole
+        // write request rejected.
+        let labels = labels_for(
+            &with_dims(r#"{"InstanceId":"a","instance_id":"b","Instance-Id":"c"}"#),
+            "m",
+        );
+        let mut names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicate label names would 400 the batch");
+    }
+
+    #[test]
+    fn labels_are_sorted_regardless_of_hashmap_iteration_order() {
+        let labels = labels_for(
+            &with_dims(r#"{"Zebra":"1","Alpha":"2","Middle":"3"}"#),
+            "m",
+        );
+        let names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+    }
+```
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -354,8 +454,49 @@ Add to the `tests` module:
 
     #[test]
     fn unknown_unit_produces_no_series() {
-        let m = values_json(r#"{"max":1.0}"#, "SomethingAWSInvented");
+        // NOTE: `MetricUnit` has no `#[serde(other)]`, so an unrecognised unit string
+        // fails deserialization outright rather than becoming `Unknown` (see issue #12).
+        // `Unknown` is only reachable via `Default`, so build it directly.
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.unit = MetricUnit::Unknown;
         assert!(to_series(&m).unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_with_no_populated_aggregates_produces_no_series() {
+        let m = values_json(r#"{}"#, "Count");
+        assert!(
+            to_series(&m).unwrap().is_empty(),
+            "must yield zero series, not one with an empty sample vec"
+        );
+    }
+
+    #[test]
+    fn non_finite_values_are_dropped() {
+        // A specific NaN payload is Prometheus's staleness marker; passing NaN through is
+        // at best meaningless and at worst indistinguishable from "this series ended".
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.value.max = Some(f32::NAN);
+        assert!(to_series(&m).unwrap().is_empty());
+
+        m.value.max = Some(f32::INFINITY);
+        assert!(to_series(&m).unwrap().is_empty());
+    }
+
+    #[test]
+    fn aggregate_order_is_stable() {
+        let m = values_json(r#"{"count":4.0,"sum":3.0,"min":2.0,"max":1.0}"#, "Count");
+        let series = to_series(&m).unwrap();
+        assert_eq!(
+            names(&series),
+            vec![
+                "firehose_test_m_count_max",
+                "firehose_test_m_count_min",
+                "firehose_test_m_count_sum",
+                "firehose_test_m_count_count",
+            ],
+            "order must not depend on JSON field order"
+        );
     }
 ```
 
@@ -382,24 +523,36 @@ pub fn to_series(metric: &CloudWatchMetric) -> anyhow::Result<Vec<(Vec<Label>, S
     let base = metric_base_name(metric)?;
     let mut out = Vec::new();
 
+    // Fixed order, independent of JSON field order.
     for (suffix, value) in [
         ("max", metric.value.max),
         ("min", metric.value.min),
         ("sum", metric.value.sum),
         ("count", metric.value.count),
     ] {
-        if let Some(value) = value {
-            let full_name = format!("{base}_{suffix}");
-            out.push((
-                labels_for(metric, &full_name),
-                Sample { value: value as f64, timestamp: metric.timestamp },
-            ));
+        let Some(value) = value else { continue };
+
+        // NaN and +/-Inf survive the `as f64` widening. A specific NaN payload is
+        // Prometheus's staleness marker, so passing one through can read as "series ended".
+        if !value.is_finite() {
+            warn!("dropping non-finite {suffix} for {}", metric.metric_name);
+            continue;
         }
+
+        let full_name = format!("{base}_{suffix}");
+        out.push((
+            labels_for(metric, &full_name),
+            Sample { value: value as f64, timestamp: metric.timestamp },
+        ));
     }
 
     Ok(out)
 }
 ```
+
+**Note on `f32` → `f64` widening:** `1.1f32 as f64` is `1.100000023841858`. The legacy path
+does the same `as f64`, so this is pass-through, not a regression — do not "fix" it, and
+expect exact-value assertions in tests to need whole numbers.
 
 - [ ] **Step 4: Run test to verify it passes**
 
