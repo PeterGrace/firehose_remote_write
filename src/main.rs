@@ -3,6 +3,7 @@ mod consts;
 mod prometheus;
 mod series;
 pub(crate) mod structs;
+mod writer;
 
 #[macro_use]
 extern crate tracing;

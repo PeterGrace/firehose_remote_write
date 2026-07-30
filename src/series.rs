@@ -197,6 +197,30 @@ pub fn labels_for(metric: &CloudWatchMetric, full_metric_name: &str) -> Vec<Labe
         });
     }
 
+    // An empty label value is equivalent to the label being absent in the Prometheus data
+    // model, so `{account_id=""}` and `{}` are ONE stored series but TWO distinct
+    // `Vec<Label>` values — and `Vec<Label>` is exactly what the writer's accumulator keys
+    // on. Two keys landing on one stored series is how duplicate timestamps and out-of-order
+    // samples get reintroduced, which is the entire defect this rewrite removes.
+    //
+    // The dimension loop above already drops empties; the four labels we set ourselves were
+    // pushed unconditionally and did not. `serde` accepts `""` for a `String` field without
+    // complaint, so `{"account_id":""}` is one malformed record away — pinned by
+    // `empty_base_label_values_are_dropped_like_dimensions`, which failed before this line
+    // existed. Dropping uniformly here is what makes the key isomorphic to the stored
+    // identity by construction rather than by coincidence.
+    //
+    // `__name__` is deliberately exempt: an empty metric name is an ERROR, not a label to
+    // drop. `metric_base_name` already bails on a name that sanitizes to empty, so this is
+    // unreachable from `to_series` — but dropping it here would silently produce a nameless
+    // series nothing rejects and no query finds, and would break the
+    // `expect("labels_for always inserts __name__")` in `to_series`. Keeping it makes such a
+    // record fail loudly at the receiver instead.
+    //
+    // The dimension-level check is NOT made redundant by this one: it also suppresses a
+    // misleading "unusable name" warning for empty-valued dimensions with bad names.
+    labels.retain(|l| l.name == "__name__" || !l.value.is_empty());
+
     // Do NOT delete this as redundant with the encoder. `WriteRequest::encode_compressed`
     // does sort labels itself, so the wire format is satisfied either way — but this sort is
     // load-bearing for two things the library does not do:
@@ -909,6 +933,55 @@ mod tests {
         assert!(labels
             .iter()
             .any(|l| l.name == "target_group" && l.value == "tg/bar"));
+    }
+
+    /// The three labels we set from record fields are pushed unconditionally, so unlike
+    /// dimensions they had no empty-value check. An empty value is equivalent to an absent
+    /// label in the Prometheus data model, so emitting one makes the `Vec<Label>` the
+    /// accumulator keys on no longer isomorphic to the stored series identity — which is the
+    /// exact class of defect (duplicate timestamps, out-of-order samples) this rewrite
+    /// exists to remove. `""` for these fields is one malformed record away: `serde` accepts
+    /// an empty string for a `String` field without complaint.
+    #[test]
+    fn empty_base_label_values_are_dropped_like_dimensions() {
+        let m = metric_from(
+            r#"{"metric_stream_name":"","account_id":"","region":"",
+                "namespace":"AWS/ApplicationELB","metric_name":"RequestCount",
+                "dimensions":{"TargetGroup":"tg/bar"},"timestamp":1700000000000,
+                "value":{"max":1.0},"unit":"Count"}"#,
+        );
+        let labels = labels_for(&m, "m");
+        assert!(
+            labels.iter().all(|l| !l.value.is_empty()),
+            "no label should carry an empty value, got {:?}",
+            label_pairs(&labels)
+        );
+        // Dropping is all that changes: the useful labels survive.
+        assert_eq!(
+            label_pairs(&labels),
+            vec![
+                ("__name__".to_string(), "m".to_string()),
+                ("target_group".to_string(), "tg/bar".to_string()),
+            ]
+        );
+    }
+
+    /// `__name__` is exempt from the empty-value drop. It is unreachable today —
+    /// `metric_base_name` bails before `to_series` can pass an empty name, pinned by
+    /// `metric_base_name_errors_when_metric_name_sanitizes_to_empty` — so this calls
+    /// `labels_for` directly. Dropping it would produce a nameless series that no receiver
+    /// rejects and no query finds; keeping it makes the failure loud instead of silent, and
+    /// keeps `to_series`'s `expect("labels_for always inserts __name__")` honest.
+    #[test]
+    fn an_empty_name_label_is_kept_not_dropped() {
+        let labels = labels_for(&with_dims(r#"{"TargetGroup":"tg/bar"}"#), "");
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.name == "__name__" && l.value.is_empty()),
+            "__name__ must survive the empty-value drop, got {:?}",
+            label_pairs(&labels)
+        );
     }
 
     #[test]
