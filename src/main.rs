@@ -138,7 +138,7 @@ async fn get_firehose(
             debug!("unable to decode cloudmetric");
         }
     }
-    STREAMS_RECEIVED.with_label_values(&[]).inc();
+    STREAMS_RECEIVED.inc();
     match push_firehose_metrics().await {
         Ok(_) => {
             let response = FirehoseResponse {

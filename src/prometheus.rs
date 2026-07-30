@@ -6,8 +6,8 @@ use convert_case::{Case, Casing};
 use lazy_static::lazy_static;
 use prometheus::core::{Collector, Metric};
 use prometheus::{
-    labels, opts, register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec,
-    Error, Gauge, GaugeVec, HistogramVec, TextEncoder,
+    labels, opts, register_counter, register_counter_vec, register_gauge, register_gauge_vec,
+    register_histogram_vec, Counter, CounterVec, Error, Gauge, GaugeVec, HistogramVec, TextEncoder,
 };
 use prometheus_remote_write::WriteRequest;
 use reqwest::Client;
@@ -29,6 +29,28 @@ macro_rules! app_histogram_opts {
     };
 }
 
+/// `app_opts!` plus the `instance` label, baked in at registration.
+///
+/// Every metric describing *this process* goes through here, and the reason it is a macro
+/// rather than a convention is that a convention is exactly what fails silently. `instance`
+/// is fixed for the lifetime of the process -- it is a constant, not a dimension -- and
+/// expressing a constant as a `*Vec` label means the value is supplied again at every call
+/// site. Two call sites that disagree (one passing the hostname, one passing `"unknown"`)
+/// do not fail; they create two child series for one replica and *split* the counts between
+/// them, so the metric stays plausible while being wrong. As a const label the value is
+/// resolved once, at registration, and no call site can restate it.
+///
+/// It also removes the per-increment `HashMap` lookup and `&[&str]` that `with_label_values`
+/// costs, on a counter incremented once per skipped record.
+///
+/// Metrics with genuinely runtime-varying dimensions -- `TOTAL_WRITES_SENT`'s `status_code`,
+/// `FRESHNESS_INFO`'s `queue_arn` -- stay `*Vec` and use this for the const part only.
+macro_rules! self_metric_opts {
+    ($a:expr, $b:expr) => {
+        app_opts!($a, $b).const_label("instance", instance_label())
+    };
+}
+
 type GaugeHash = Arc<Mutex<HashMap<String, GaugeVec>>>;
 type CounterHash = Arc<Mutex<HashMap<String, CounterVec>>>;
 type HistoHash = Arc<Mutex<HashMap<String, HistogramVec>>>;
@@ -40,77 +62,67 @@ lazy_static! {
     pub static ref COUNTERS: CounterHash = Arc::new(Mutex::new(HashMap::new()));
     pub static ref HISTOGRAMS: HistoHash = Arc::new(Mutex::new(HashMap::new()));
     pub static ref DIMENSION_HASH: DimensionHash = Arc::new(Mutex::new(HashMap::new()));
+    // `crate_version` and `git_hash` are as process-constant as `instance` is and could be
+    // const labels too, but they are left as variable labels here: this is pre-existing
+    // shape with pre-existing call sites, and the coordinator's scope is adding `instance`.
     pub static ref APP_INFO: GaugeVec = register_gauge_vec!(
-        app_opts!(
+        self_metric_opts!(
             "firehose_app_info",
             "static app labels that potentially only change at restart"
         ),
         &["crate_version", "git_hash"]
     )
     .unwrap();
+    // `queue_arn` genuinely varies at runtime -- one child per discovered firehose -- so this
+    // stays a Vec and takes `instance` as the const part only.
     pub static ref FRESHNESS_INFO: GaugeVec = register_gauge_vec!(
-        app_opts!(
+        self_metric_opts!(
             "queue_freshness_seconds",
             "The maximum age of currently enqueued records in the firehose queue, in seconds"
         ),
         &["queue_arn"]
     )
     .unwrap();
-    pub static ref STREAMS_RECEIVED: CounterVec = register_counter_vec!(
-        app_opts!(
-            "self_kinesis_payloads_received_count",
-            "The number of kinesis payloads received"
-        ),
-        &[]
-    )
+    // Was a `CounterVec` with an empty label set, which is a `*Vec` that can only ever hold
+    // one child: all the indirection of a dimension with none of the dimensionality.
+    pub static ref STREAMS_RECEIVED: Counter = register_counter!(self_metric_opts!(
+        "self_kinesis_payloads_received_count",
+        "The number of kinesis payloads received"
+    ))
     .unwrap();
+    // `status_code` is the point of this metric, so it stays a Vec.
     pub static ref TOTAL_WRITES_SENT: CounterVec = register_counter_vec!(
-        app_opts!(
+        self_metric_opts!(
             "self_remote_writes_sent_count",
             "The number of remnote writes attempted"
         ),
         &["status_code"]
     )
     .unwrap();
-    pub static ref RECORDS_SKIPPED: CounterVec = register_counter_vec!(
-        app_opts!(
-            "self_records_skipped_count",
-            "Malformed records dropped during parse"
-        ),
-        &["instance"]
-    )
+    pub static ref RECORDS_SKIPPED: Counter = register_counter!(self_metric_opts!(
+        "self_records_skipped_count",
+        "Malformed records dropped during parse"
+    ))
     .unwrap();
-    pub static ref BATCHES_DROPPED: CounterVec = register_counter_vec!(
-        app_opts!(
-            "self_batches_dropped_count",
-            "Batches abandoned after exhausting retries"
-        ),
-        &["instance"]
-    )
+    pub static ref BATCHES_DROPPED: Counter = register_counter!(self_metric_opts!(
+        "self_batches_dropped_count",
+        "Batches abandoned after exhausting retries"
+    ))
     .unwrap();
-    pub static ref REJECTED_PAYLOADS: CounterVec = register_counter_vec!(
-        app_opts!(
-            "self_rejected_payloads_count",
-            "Payloads rejected because the buffer was full"
-        ),
-        &["instance"]
-    )
+    pub static ref REJECTED_PAYLOADS: Counter = register_counter!(self_metric_opts!(
+        "self_rejected_payloads_count",
+        "Payloads rejected because the buffer was full"
+    ))
     .unwrap();
-    pub static ref BUFFER_SERIES: GaugeVec = register_gauge_vec!(
-        app_opts!(
-            "self_buffer_series",
-            "Series currently buffered awaiting flush"
-        ),
-        &["instance"]
-    )
+    pub static ref BUFFER_SERIES: Gauge = register_gauge!(self_metric_opts!(
+        "self_buffer_series",
+        "Series currently buffered awaiting flush"
+    ))
     .unwrap();
-    pub static ref FLUSH_DURATION: GaugeVec = register_gauge_vec!(
-        app_opts!(
-            "self_flush_duration_seconds",
-            "Duration of the most recent flush"
-        ),
-        &["instance"]
-    )
+    pub static ref FLUSH_DURATION: Gauge = register_gauge!(self_metric_opts!(
+        "self_flush_duration_seconds",
+        "Duration of the most recent flush"
+    ))
     .unwrap();
 }
 
@@ -137,13 +149,14 @@ pub fn instance_label_value(hostname: Option<String>) -> String {
 /// once at first use closes that window instead of reopening it on every metric increment.
 ///
 /// Returning `&'static str` rather than `String` is the point of the cache: a cached value
-/// that is cloned on the way out still allocates per call. It is also what every call site
-/// wants, since `with_label_values` takes `&[&str]`.
+/// that is cloned on the way out still allocates per call. It is also what `const_label` and
+/// `with_label_values` both want.
 ///
-/// Using this everywhere rather than passing a hostname around is load-bearing for a second
-/// reason: these are `*Vec` metrics keyed on the label value, so two call sites disagreeing
-/// about it -- one passing the hostname, one passing `"unknown"` -- would silently produce
-/// two child series for one replica, and the counts would be split rather than wrong-looking.
+/// Note the division of labour with [`self_metric_opts!`]: this is called once per metric, at
+/// registration, not once per increment. The hazard it used to guard against -- two call
+/// sites disagreeing about the value and silently splitting one replica's counts across two
+/// child series -- is now structurally impossible for these metrics, because the value is
+/// baked into the descriptor and there is no call site that can restate it.
 pub fn instance_label() -> &'static str {
     static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| instance_label_value(env::var("HOSTNAME").ok()))
@@ -398,39 +411,58 @@ mod tests {
     }
 
     /// `lazy_static` registers a metric into the global registry the first time it is
-    /// *touched*, and nothing touches these until tasks 9-11 wire them up. Until then a
-    /// duplicate metric name or a malformed label would sail through the whole suite and
+    /// *touched*, and nothing touches most of these until tasks 9-11 wire them up. Until then
+    /// a duplicate metric name or a malformed label would sail through the whole suite and
     /// panic on the `.unwrap()` in production, at the first record we tried to count.
     ///
-    /// So touch every one of them here and assert it arrives in `gather()` under the name and
-    /// label an operator will query by. This also pins the `firehose_` namespace onto the
-    /// names: `app_opts!` supplies it, and losing it would rename every self-metric at once.
+    /// The load-bearing assertion is that `instance` is on the **gathered output**. Baking it
+    /// in as a const label is worthless if the label then silently fails to appear -- the
+    /// metric would still register, still increment, still look healthy, and simply not be
+    /// attributable to a replica. Nothing else in the suite would notice, because with a const
+    /// label there is no call site left that mentions `instance` at all.
     ///
-    /// The child series is looked up by its label value rather than taken as `get_metric()[0]`.
-    /// The registry is global and a `*Vec` family holds one child per label value, so a
-    /// sibling test touching the same metric with a different `instance` adds a child whose
-    /// position in the family is not defined. The first draft indexed `[0]` and failed 4 runs
-    /// in 10 against `the_gauges_report_the_last_value_set_rather_than_a_total` -- an ordering
-    /// assumption, not a real defect, but it would have been indistinguishable from one.
+    /// This also pins the `firehose_` namespace onto every name: `app_opts!` supplies it, and
+    /// losing it would rename every self-metric at once.
+    ///
+    /// # One caveat, measured
+    ///
+    /// The assertion is that the label equals `instance_label()`, so a mutation hardcoding the
+    /// const label to `"unknown"` is only caught when `HOSTNAME` is actually set -- verified
+    /// killed with it set and SURVIVING under `env -u HOSTNAME`, where both sides are
+    /// `"unknown"` and agree. Same class of gap as
+    /// `instance_label_agrees_with_the_environment_it_read`, and the same judgement: every
+    /// deployment target sets `HOSTNAME`, so it holds where it matters. The label's *presence*
+    /// and *name* are watched unconditionally; only its value has this dependency.
+    ///
+    /// # Why this is one test and not several
+    ///
+    /// A plain `Counter`/`Gauge` is a process-wide singleton with no label to isolate on, so
+    /// two tests writing the same static race on its value -- which is the cost of dropping
+    /// the `*Vec`, and worth stating rather than discovering. The previous `*Vec` version of
+    /// this test split the work across two tests and flaked 4 runs in 10 for exactly that
+    /// reason. All writes to the plain self-metrics therefore live here.
     #[test]
-    fn every_self_metric_registers_under_its_namespaced_name() {
+    fn every_self_metric_registers_with_the_instance_const_label() {
         let _log = LogTail::start();
         let instance = instance_label();
 
-        RECORDS_SKIPPED.with_label_values(&[instance]).inc();
-        BATCHES_DROPPED.with_label_values(&[instance]).inc();
-        REJECTED_PAYLOADS.with_label_values(&[instance]).inc();
-        BUFFER_SERIES.with_label_values(&[instance]).set(7.0);
-        FLUSH_DURATION.with_label_values(&[instance]).set(0.25);
+        // Touch every self-metric so `lazy_static` registers it.
+        APP_INFO
+            .with_label_values(&["0.0.0-test", "deadbeef"])
+            .set(1.0);
+        FRESHNESS_INFO
+            .with_label_values(&["arn:aws:firehose:test"])
+            .set(12.0);
+        TOTAL_WRITES_SENT.with_label_values(&["200"]).inc();
+        STREAMS_RECEIVED.inc();
+        RECORDS_SKIPPED.inc();
+        BATCHES_DROPPED.inc();
+        REJECTED_PAYLOADS.inc();
+        BUFFER_SERIES.set(7.0);
+        FLUSH_DURATION.set(0.25);
 
         let families = prometheus::gather();
-        for name in [
-            "firehose_self_records_skipped_count",
-            "firehose_self_batches_dropped_count",
-            "firehose_self_rejected_payloads_count",
-            "firehose_self_buffer_series",
-            "firehose_self_flush_duration_seconds",
-        ] {
+        let labels_of = |name: &str| -> Vec<BTreeMap<String, String>> {
             let family = families
                 .iter()
                 .find(|f| f.get_name() == name)
@@ -440,42 +472,97 @@ mod tests {
                         families.iter().map(|f| f.get_name()).collect::<Vec<_>>()
                     )
                 });
-
-            let children: Vec<Vec<(&str, &str)>> = family
+            family
                 .get_metric()
                 .iter()
                 .map(|m| {
                     m.get_label()
                         .iter()
-                        .map(|l| (l.get_name(), l.get_value()))
+                        .map(|l| (l.get_name().to_string(), l.get_value().to_string()))
                         .collect()
                 })
-                .collect();
+                .collect()
+        };
 
-            assert!(
-                children.contains(&vec![("instance", instance)]),
-                "{name} must carry exactly the instance label, got children: {children:?}"
+        // Every self-metric, whether or not it also has runtime dimensions, must carry
+        // `instance` on every child it emits.
+        for name in [
+            "firehose_firehose_app_info",
+            "firehose_queue_freshness_seconds",
+            "firehose_self_kinesis_payloads_received_count",
+            "firehose_self_remote_writes_sent_count",
+            "firehose_self_records_skipped_count",
+            "firehose_self_batches_dropped_count",
+            "firehose_self_rejected_payloads_count",
+            "firehose_self_buffer_series",
+            "firehose_self_flush_duration_seconds",
+        ] {
+            let children = labels_of(name);
+            assert!(!children.is_empty(), "{name} gathered no series at all");
+            for child in &children {
+                assert_eq!(
+                    child.get("instance").map(String::as_str),
+                    Some(instance),
+                    "{name} must carry the instance const label, got: {child:?}"
+                );
+            }
+        }
+
+        // The five converted metrics are plain, so `instance` is their ENTIRE label set. An
+        // extra label here would mean something re-introduced a dimension.
+        for name in [
+            "firehose_self_kinesis_payloads_received_count",
+            "firehose_self_records_skipped_count",
+            "firehose_self_batches_dropped_count",
+            "firehose_self_rejected_payloads_count",
+            "firehose_self_buffer_series",
+            "firehose_self_flush_duration_seconds",
+        ] {
+            let children = labels_of(name);
+            assert_eq!(
+                children.len(),
+                1,
+                "{name} is plain and can only have one series"
+            );
+            assert_eq!(
+                children[0].keys().collect::<Vec<_>>(),
+                vec!["instance"],
+                "{name} must carry instance and nothing else"
             );
         }
-    }
 
-    /// The two gauges must report the value they were set to, not an accumulated one. A
-    /// `Counter` silently substituted for `BUFFER_SERIES` would still compile at the call
-    /// site (`inc`/`set` differ, but a `CounterVec`/`GaugeVec` mixup is a one-word edit) and
-    /// would turn "series currently buffered" into "series ever buffered".
-    #[test]
-    fn the_gauges_report_the_last_value_set_rather_than_a_total() {
-        let _log = LogTail::start();
-        // A label value unique to this test, so the shared global registry cannot leak the
-        // `every_self_metric_registers...` child series into these assertions.
-        let who = "gauge-semantics-probe";
-        BUFFER_SERIES.with_label_values(&[who]).set(10.0);
-        BUFFER_SERIES.with_label_values(&[who]).set(3.0);
-        FLUSH_DURATION.with_label_values(&[who]).set(1.5);
-        FLUSH_DURATION.with_label_values(&[who]).set(0.5);
+        // The two that kept a real dimension must have BOTH, not one or the other: dropping
+        // the const label and dropping the dimension are different bugs with the same shape.
+        let writes = labels_of("firehose_self_remote_writes_sent_count");
+        assert!(
+            writes
+                .iter()
+                .any(|c| c.get("status_code").map(String::as_str) == Some("200")),
+            "status_code must survive alongside the const label, got: {writes:?}"
+        );
+        let freshness = labels_of("firehose_queue_freshness_seconds");
+        assert!(
+            freshness
+                .iter()
+                .any(|c| c.get("queue_arn").map(String::as_str) == Some("arn:aws:firehose:test")),
+            "queue_arn must survive alongside the const label, got: {freshness:?}"
+        );
 
-        assert_eq!(BUFFER_SERIES.with_label_values(&[who]).get(), 3.0);
-        assert_eq!(FLUSH_DURATION.with_label_values(&[who]).get(), 0.5);
+        // Gauge semantics, asserted here because this test owns all writes to these two: a
+        // gauge reports the last value set, not an accumulated one. A `Counter` substituted
+        // for `BUFFER_SERIES` would turn "series currently buffered" into "series ever
+        // buffered" while still compiling everywhere it is read.
+        BUFFER_SERIES.set(10.0);
+        BUFFER_SERIES.set(3.0);
+        FLUSH_DURATION.set(1.5);
+        FLUSH_DURATION.set(0.5);
+        assert_eq!(BUFFER_SERIES.get(), 3.0);
+        assert_eq!(FLUSH_DURATION.get(), 0.5);
+
+        // And the counters only go up.
+        let before = RECORDS_SKIPPED.get();
+        RECORDS_SKIPPED.inc();
+        assert_eq!(RECORDS_SKIPPED.get(), before + 1.0);
     }
 
     /// Seed the dimension cache so `record_metric` does not call out to AWS, and so the
