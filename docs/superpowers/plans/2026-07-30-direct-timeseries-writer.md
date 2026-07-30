@@ -559,8 +559,12 @@ pub fn to_series(
         return Ok(vec![]);
     }
 
-    let age = now_ms - metric.timestamp;
-    if age < -MAX_FUTURE_MS || age > MAX_PAST_MS {
+    // saturating_sub, NOT `-`: `timestamp` is a bare i64 off untrusted JSON, and
+    // `now_ms - i64::MIN` panics in debug or wraps in release to a small in-window age,
+    // letting a garbage timestamp through -- the guard producing the exact outcome it
+    // exists to prevent. Range form avoids clippy::manual_range_contains.
+    let age = now_ms.saturating_sub(metric.timestamp);
+    if !(-MAX_FUTURE_MS..=MAX_PAST_MS).contains(&age) {
         warn!(
             "dropping {} {} with out-of-window timestamp {} (now {})",
             metric.namespace, metric.metric_name, metric.timestamp, now_ms
@@ -570,13 +574,14 @@ pub fn to_series(
 
     let base = metric_base_name(metric)?;
 
-    // Build the label set ONCE per record, not once per aggregate. Calling `labels_for`
-    // four times would re-run dedup four times, and which value survives a dimension-name
-    // collision depends on `HashMap` iteration order — four calls agreeing is an accident,
-    // not a guarantee. If it ever stopped holding, `_max` would carry one value and `_min`
-    // another, silently splitting one metric across two series with no error anywhere.
-    // It also fires the dedup warning 4x per record and clones the dimension map 4x on the
-    // hot ingest path.
+    // Build the label set ONCE per record, not once per aggregate.
+    //
+    // The tempting justification -- "four calls might disagree on which value survives a
+    // dimension collision" -- does NOT hold: `to_labels_values` clones the map and
+    // `HashMap::clone` preserves iteration order, so the four calls agree deterministically
+    // within a run. Do not re-derive that argument. The real reasons are that four calls
+    // fire the dedup warning four times per record, and clone the dimension map four times
+    // on the hot ingest path.
     let base_labels = labels_for(metric, &base);
 
     let mut out = Vec::new();
@@ -597,9 +602,14 @@ pub fn to_series(
             continue;
         }
 
-        // Clone the shared label set and retarget `__name__`. Do NOT assume it is at
-        // index 0 — labels are sorted by name, and a dimension normalizing to something
-        // like `__abc` would sort ahead of it.
+        // Clone the shared label set and retarget `__name__`.
+        //
+        // `find` rather than `labels[0]` is defence in depth and kills no mutant today:
+        // every dimension-derived name starts with an ASCII lowercase letter (the trim
+        // removes leading `_`, and a leading digit gets a `d_` prefix), and `_` sorts
+        // below every lowercase letter, so `__name__` is always index 0. That is a
+        // coincidence of the current normalizer, not a guarantee -- loosen the Task 2
+        // trim and `!!abc` -> `__abc` sorts ahead of it immediately.
         let mut labels = base_labels.clone();
         let name_label = labels
             .iter_mut()
