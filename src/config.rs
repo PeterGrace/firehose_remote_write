@@ -8,8 +8,37 @@ pub struct Config {
     pub push_max_retries: u32,
 }
 
-fn parse_or<T: std::str::FromStr>(raw: Option<&str>, default: T) -> T {
-    raw.and_then(|v| v.parse::<T>().ok()).unwrap_or(default)
+/// Parse one environment-derived value, falling back to `default` and saying so.
+///
+/// `name` exists only so the warning can identify which variable was rejected. A config
+/// value that is silently replaced is the same failure mode this project keeps finding
+/// elsewhere: `FLUSH_MAX_SERIES=20_000` is accepted by the operator's eyes, parsed as
+/// nothing, and becomes 2000 — a twentieth of what they asked for, with no evidence.
+///
+/// The raw string is trimmed before parsing. `FromStr` for the integer types rejects
+/// surrounding whitespace, and a trailing space is trivially produced by a Helm value, a
+/// YAML scalar, or a `.env` file — none of which look wrong to the person who wrote them.
+///
+/// The warning reports the **untrimmed** value, quoted via `{:?}`. That matters for the
+/// all-whitespace case: `"  "` trims to `""`, and a message ending in `using default 1`
+/// after an invisible value reads like a bug in the logger rather than a rejected setting.
+/// Quoting shows `"  "` and naming the original shows what the operator actually set.
+fn parse_or<T: std::str::FromStr + std::fmt::Display>(
+    name: &str,
+    raw: Option<&str>,
+    default: T,
+) -> T {
+    // An unset variable is not a mistake and must not warn — only a *present but unusable*
+    // one is worth an operator's attention.
+    let Some(raw) = raw else { return default };
+
+    match raw.trim().parse::<T>() {
+        Ok(value) => value,
+        Err(_) => {
+            warn!("{name}={raw:?} is not a valid value; using default {default}");
+            default
+        }
+    }
 }
 
 impl Config {
@@ -20,27 +49,30 @@ impl Config {
         channel_capacity: Option<&str>,
         push_max_retries: Option<&str>,
     ) -> Self {
-        let flush_interval_secs = parse_or(flush_interval_secs, 1u64);
-        let flush_max_series = parse_or(flush_max_series, 2000usize);
-        let channel_capacity = parse_or(channel_capacity, 1024usize);
+        let flush_interval_secs = parse_or("FLUSH_INTERVAL_SECS", flush_interval_secs, 1u64);
+        let flush_max_series = parse_or("FLUSH_MAX_SERIES", flush_max_series, 2000usize);
+        let channel_capacity = parse_or("CHANNEL_CAPACITY", channel_capacity, 1024usize);
 
+        // The three zero-guards below each warn for the same reason `parse_or` does, but they
+        // are a genuinely different failure: the value parsed fine and the operator's intent
+        // was unambiguous, we are simply refusing to honour it. Saying which value was
+        // rejected AND why zero is unusable is what turns "my setting did nothing" into a
+        // one-line diagnosis.
         Self {
-            // A zero interval would spin the writer loop; fall back to the default.
             flush_interval_secs: if flush_interval_secs == 0 {
+                warn!("FLUSH_INTERVAL_SECS=0 would spin the writer loop with no delay between flushes; using default 1");
                 1
             } else {
                 flush_interval_secs
             },
-            // Zero would flush on every single sample, turning one write request per batch
-            // into one per sample.
             flush_max_series: if flush_max_series == 0 {
+                warn!("FLUSH_MAX_SERIES=0 would flush on every series, turning one write request per batch into one per sample; using default 2000");
                 2000
             } else {
                 flush_max_series
             },
-            // A zero-capacity `tokio::sync::mpsc` channel panics on construction, so this
-            // guard is what stops a stray `CHANNEL_CAPACITY=0` from crashing startup.
             channel_capacity: if channel_capacity == 0 {
+                warn!("CHANNEL_CAPACITY=0 would panic tokio's mpsc channel on construction; using default 1024");
                 1024
             } else {
                 channel_capacity
@@ -51,7 +83,7 @@ impl Config {
             // retry", which is a real operational choice (fail fast, let Firehose redeliver).
             // Silently rewriting it to 3 would be worse than the floor. See the module test
             // `zero_push_max_retries_is_preserved_not_defaulted`.
-            push_max_retries: parse_or(push_max_retries, 3u32),
+            push_max_retries: parse_or("PUSH_MAX_RETRIES", push_max_retries, 3u32),
         }
     }
 
@@ -141,16 +173,49 @@ mod tests {
         assert_eq!(c.push_max_retries, 3);
     }
 
-    /// Documented sharp edge, not an endorsement. `FromStr` for the integer types rejects
-    /// surrounding whitespace, so `FLUSH_INTERVAL_SECS=" 5"` — trivially produced by a YAML
-    /// list, a Helm value, or a trailing space in a `.env` file — silently becomes the
-    /// default with no log line. If this is ever changed to trim, this test is the one that
-    /// should be updated, deliberately.
+    /// Padding is tolerated. `FromStr` for the integer types rejects surrounding whitespace,
+    /// so without the trim in `parse_or` these silently became the defaults — and a leading
+    /// or trailing space is trivially produced by a YAML scalar, a Helm value, or a `.env`
+    /// file, none of which look wrong to the person who wrote them. Both sides and both
+    /// orders are covered so that trimming only one end fails here.
     #[test]
-    fn whitespace_padded_values_do_not_parse_and_take_the_default() {
-        let c = Config::from_values(Some(" 5"), Some("10 "), None, None);
+    fn whitespace_padded_values_are_trimmed_and_parsed() {
+        let c = Config::from_values(Some(" 5"), Some("10 "), Some(" 20 "), Some("\t7\n"));
+        assert_eq!(c.flush_interval_secs, 5);
+        assert_eq!(c.flush_max_series, 10);
+        assert_eq!(c.channel_capacity, 20);
+        assert_eq!(c.push_max_retries, 7);
+    }
+
+    /// The interaction the trim creates: `"  "` trims to `""`, which parses as nothing and
+    /// takes the default. That is the right outcome — an all-whitespace setting is not a
+    /// number — but it is the case whose warning would otherwise read as `FLUSH_INTERVAL_SECS=
+    /// is not a valid value`, so `parse_or` reports the untrimmed value quoted.
+    #[test]
+    fn an_all_whitespace_value_falls_back_to_the_default() {
+        let c = Config::from_values(Some("   "), Some("\t"), Some(" "), Some("\n"));
         assert_eq!(c.flush_interval_secs, 1);
         assert_eq!(c.flush_max_series, 2000);
+        assert_eq!(c.channel_capacity, 1024);
+        assert_eq!(c.push_max_retries, 3);
+    }
+
+    /// Trimming must not make an otherwise-invalid value parse. Internal whitespace is still
+    /// an error, so `5 0` cannot quietly become `50`.
+    #[test]
+    fn internal_whitespace_is_still_unparseable() {
+        let c = Config::from_values(Some("5 0"), None, None, None);
+        assert_eq!(c.flush_interval_secs, 1);
+    }
+
+    /// A trimmed value still meets the zero-guards: `" 0 "` must be rejected exactly as `"0"`
+    /// is, not slip past because the guard runs on a differently-parsed value.
+    #[test]
+    fn a_padded_zero_still_hits_the_zero_guards() {
+        let c = Config::from_values(Some(" 0 "), Some(" 0 "), Some(" 0 "), None);
+        assert_eq!(c.flush_interval_secs, 1);
+        assert_eq!(c.flush_max_series, 2000);
+        assert_eq!(c.channel_capacity, 1024);
     }
 
     /// The only test that can catch a typo'd or transposed environment variable name.
