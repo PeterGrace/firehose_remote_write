@@ -445,7 +445,7 @@ Add to the `tests` module:
     #[test]
     fn all_four_aggregates_become_separate_series() {
         let m = values_json(r#"{"max":1.0,"min":2.0,"sum":3.0,"count":4.0}"#, "Count");
-        let series = to_series(&m).unwrap();
+        let series = to_series(&m, NOW).unwrap();
         assert_eq!(
             names(&series),
             vec![
@@ -460,14 +460,14 @@ Add to the `tests` module:
     #[test]
     fn absent_aggregates_produce_no_series() {
         let m = values_json(r#"{"min":2.0}"#, "Count");
-        let series = to_series(&m).unwrap();
+        let series = to_series(&m, NOW).unwrap();
         assert_eq!(names(&series), vec!["firehose_test_m_count_min"]);
     }
 
     #[test]
     fn sample_carries_record_timestamp_and_value() {
         let m = values_json(r#"{"max":42.0}"#, "Count");
-        let series = to_series(&m).unwrap();
+        let series = to_series(&m, NOW).unwrap();
         assert_eq!(series[0].1.timestamp, 1700000000000);
         assert_eq!(series[0].1.value, 42.0);
     }
@@ -479,14 +479,14 @@ Add to the `tests` module:
         // `Unknown` is only reachable via `Default`, so build it directly.
         let mut m = values_json(r#"{"max":1.0}"#, "Count");
         m.unit = MetricUnit::Unknown;
-        assert!(to_series(&m).unwrap().is_empty());
+        assert!(to_series(&m, NOW).unwrap().is_empty());
     }
 
     #[test]
     fn record_with_no_populated_aggregates_produces_no_series() {
         let m = values_json(r#"{}"#, "Count");
         assert!(
-            to_series(&m).unwrap().is_empty(),
+            to_series(&m, NOW).unwrap().is_empty(),
             "must yield zero series, not one with an empty sample vec"
         );
     }
@@ -497,16 +497,16 @@ Add to the `tests` module:
         // at best meaningless and at worst indistinguishable from "this series ended".
         let mut m = values_json(r#"{"max":1.0}"#, "Count");
         m.value.max = Some(f32::NAN);
-        assert!(to_series(&m).unwrap().is_empty());
+        assert!(to_series(&m, NOW).unwrap().is_empty());
 
         m.value.max = Some(f32::INFINITY);
-        assert!(to_series(&m).unwrap().is_empty());
+        assert!(to_series(&m, NOW).unwrap().is_empty());
     }
 
     #[test]
     fn aggregate_order_is_stable() {
         let m = values_json(r#"{"count":4.0,"sum":3.0,"min":2.0,"max":1.0}"#, "Count");
-        let series = to_series(&m).unwrap();
+        let series = to_series(&m, NOW).unwrap();
         assert_eq!(
             names(&series),
             vec![
@@ -1553,7 +1553,7 @@ mod tests {
             r#""timestamp":1700000000000,"value":{"max":1.0},"unit":"Count"}"#,
             "\n",
         );
-        let series = parse_lines(text);
+        let series = parse_lines(text, 1700000000000);
         assert_eq!(series.len(), 1);
     }
 }
@@ -1613,7 +1613,10 @@ fn decode_payloads(records: Vec<FirehoseData>) -> String {
 }
 
 /// Parse newline-delimited CloudWatch metric JSON into remote-write series.
-fn parse_lines(text: &str) -> Vec<(Vec<Label>, Sample)> {
+///
+/// `now_ms` is read once for the whole batch and threaded through, so every record in
+/// one payload is judged against the same clock reading.
+fn parse_lines(text: &str, now_ms: i64) -> Vec<(Vec<Label>, Sample)> {
     let mut out = Vec::new();
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -1627,7 +1630,7 @@ fn parse_lines(text: &str) -> Vec<(Vec<Label>, Sample)> {
                 continue;
             }
         };
-        match crate::series::to_series(&metric) {
+        match crate::series::to_series(&metric, now_ms) {
             Ok(series) => out.extend(series),
             Err(e) => {
                 debug!("skipping record: {e}");
@@ -1669,7 +1672,13 @@ async fn get_firehose(
         text = message;
     }
 
-    let series = parse_lines(&text);
+    // Read the clock once per batch so every record is judged against the same reading.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let series = parse_lines(&text, now_ms);
     STREAMS_RECEIVED.with_label_values(&[]).inc();
 
     if series.is_empty() {
