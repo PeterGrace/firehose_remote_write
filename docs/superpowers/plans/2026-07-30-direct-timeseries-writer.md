@@ -44,6 +44,22 @@ far from its cause, flakily, depending on which module's tests run first.
 An unwatched `warn!` rots: it can be deleted, corrupted, or made to fire spuriously on
 every startup without a single test noticing.
 
+**Every test in a module that logs must open a `LogTail`, including the ones that never
+read the buffer.** Partial adoption is indistinguishable from none: the lock only excludes
+other lock holders, so a sibling test that emits the very warning your absence-assertion
+checks for will land in your window while holding nothing. Measured at 1 failure in 8 runs
+before full adoption. Also beware `let _ = LogTail::start()` -- that drops the guard
+immediately and silently restores the flake; bind it to a named variable.
+
+### Formatting
+
+Use `rustfmt --edition 2021 <leaf module>`, never `cargo fmt`.
+
+**Never run `rustfmt` on `src/main.rs`.** The crate root is the one file where per-file
+`rustfmt` behaves exactly like `cargo fmt` -- it recurses the whole module tree and will
+silently restyle files the task never touched. Format the leaf module and hand-edit the
+root.
+
 
 **The `firehose_` prefix is now yours to add.** Today `app_opts!` calls
 `.namespace(PROM_NAMESPACE)`, and the prometheus crate builds `fq_name = "{namespace}_{name}"`.
