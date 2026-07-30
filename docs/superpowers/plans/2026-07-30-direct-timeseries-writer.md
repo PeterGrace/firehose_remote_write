@@ -237,8 +237,15 @@ Add to `src/series.rs`:
 use convert_case::{Case, Casing};
 
 /// Reserved label names we set ourselves. A dimension normalizing onto any of these
-/// would overwrite our own label — `__name__` worst of all, which would clobber the
-/// metric name — so collisions are prefixed instead.
+/// would overwrite our own label, so collisions are prefixed instead.
+///
+/// Reachability differs per entry, verified by mutation testing:
+/// - `metric_stream_name`, `account_id`: reachable from a real dimension name.
+/// - `region`: unreachable via `labels_for` because `to_labels_values()` pre-maps it,
+///   but reachable when calling this function directly, so it is pinned by a unit test.
+/// - `__name__`: provably unreachable — `to_case(Case::Snake)` strips leading and
+///   trailing underscores, so no input can clean to it. Kept as defence-in-depth
+///   against a future change to the normalization, not as live protection.
 const RESERVED_LABELS: [&str; 4] = ["__name__", "metric_stream_name", "account_id", "region"];
 
 /// Normalize a CloudWatch dimension name into a valid Prometheus label name.
@@ -261,7 +268,12 @@ fn label_name_for_dimension(name: &str) -> Option<String> {
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
         .collect();
 
-    if cleaned.is_empty() {
+    // NOT `is_empty()`. Sanitization REPLACES rather than deletes, so `!!!` becomes
+    // `___`, not `""` — a technically-valid label name that would ship silently, and
+    // one that every all-punctuation dimension name collapses onto, producing the
+    // duplicate that gets the whole batch rejected. `all()` is vacuously true on "",
+    // so this subsumes the empty case.
+    if cleaned.chars().all(|c| c == '_') {
         return None;
     }
 
