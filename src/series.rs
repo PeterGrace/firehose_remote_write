@@ -43,12 +43,18 @@ pub fn metric_base_name(metric: &CloudWatchMetric) -> anyhow::Result<String> {
         );
     }
 
-    Ok(format!(
-        "{PROM_NAMESPACE}_{}_{}_{}",
-        service,
-        sanitize_metric_name(&metric.metric_name.to_lowercase()),
-        metric.unit
-    ))
+    // Same defect class as the service guard above: "!!!" and "..." both sanitize to empty
+    // and would collapse onto one series. Bailing costs one dropped record; emitting the
+    // malformed name silently corrupts a series other records write to legitimately.
+    let name = sanitize_metric_name(&metric.metric_name.to_lowercase());
+    if name.is_empty() {
+        anyhow::bail!(
+            "metric name {:?} has no usable characters",
+            metric.metric_name
+        );
+    }
+
+    Ok(format!("{PROM_NAMESPACE}_{service}_{name}_{}", metric.unit))
 }
 
 #[cfg(test)]
@@ -90,14 +96,15 @@ mod tests {
         );
     }
 
-    /// Pin the failure mode, not just "some error". A bare `is_err()` would stay green if
-    /// this function later failed for an unrelated reason and stopped exercising the
-    /// malformed-namespace path these tests exist to guard.
-    fn assert_namespace_error(err: anyhow::Error, namespace: &str) {
+    /// Pin *which* guard fired, not just "some error". A bare `is_err()` would stay green if
+    /// this function later failed for an unrelated reason and stopped exercising the path
+    /// these tests exist to guard. Asserting the subject as well as the offending value also
+    /// holds the namespace and metric-name failures distinguishable to someone reading logs.
+    fn assert_error_names(err: anyhow::Error, subject: &str, value: &str) {
         let msg = format!("{err:#}");
         assert!(
-            msg.contains(namespace),
-            "expected error naming namespace {namespace:?}, got: {msg}"
+            msg.contains(subject) && msg.contains(value),
+            "expected error naming {subject} {value:?}, got: {msg}"
         );
     }
 
@@ -105,28 +112,42 @@ mod tests {
     fn metric_base_name_errors_when_namespace_has_no_slash() {
         let m = base("NoSlashHere", "Whatever", "Count");
         let err = metric_base_name(&m).expect_err("should not build a name");
-        assert_namespace_error(err, "NoSlashHere");
+        assert_error_names(err, "namespace", "NoSlashHere");
     }
 
     #[test]
     fn metric_base_name_errors_when_service_segment_is_empty() {
         let m = base("AWS/", "Whatever", "Count");
         let err = metric_base_name(&m).expect_err("should not build a name");
-        assert_namespace_error(err, "AWS/");
+        assert_error_names(err, "namespace", "AWS/");
     }
 
     #[test]
     fn metric_base_name_errors_when_service_segment_is_empty_between_slashes() {
         let m = base("AWS//Deep", "Whatever", "Count");
         let err = metric_base_name(&m).expect_err("should not build a name");
-        assert_namespace_error(err, "AWS//Deep");
+        assert_error_names(err, "namespace", "AWS//Deep");
     }
 
     #[test]
     fn metric_base_name_errors_when_service_segment_sanitizes_to_empty() {
         let m = base("AWS/!!!", "Whatever", "Count");
         let err = metric_base_name(&m).expect_err("should not build a name");
-        assert_namespace_error(err, "AWS/!!!");
+        assert_error_names(err, "namespace", "AWS/!!!");
+    }
+
+    #[test]
+    fn metric_base_name_errors_when_metric_name_sanitizes_to_empty() {
+        let m = base("AWS/Firehose", "!!!", "Count");
+        let err = metric_base_name(&m).expect_err("should not build a name");
+        assert_error_names(err, "metric name", "!!!");
+    }
+
+    #[test]
+    fn metric_base_name_errors_when_metric_name_is_all_punctuation() {
+        let m = base("AWS/Firehose", "...", "Count");
+        let err = metric_base_name(&m).expect_err("should not build a name");
+        assert_error_names(err, "metric name", "...");
     }
 
     #[test]
