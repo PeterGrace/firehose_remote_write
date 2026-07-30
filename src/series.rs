@@ -387,7 +387,7 @@ pub fn to_series(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use crate::testlog::{captured_logs, log_sink};
 
     fn metric_from(json: &str) -> CloudWatchMetric {
         serde_json::from_str(json).expect("fixture should deserialize")
@@ -510,67 +510,6 @@ mod tests {
                  "metric_name":"RequestCount","dimensions":{dims},
                  "timestamp":1700000000000,"value":{{"max":1.0}},"unit":"Count"}}"#
         ))
-    }
-
-    /// Capture `tracing` output so tests can assert on log lines.
-    ///
-    /// A dropped label that is never logged is invisible in production, so "does it warn" is
-    /// a real behaviour and needs a real assertion — without this, deleting the `warn!` kills
-    /// no test and the guard rots.
-    #[derive(Clone, Default)]
-    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Install a process-wide log sink exactly once, and hand back its buffer.
-    ///
-    /// This is deliberately *global* rather than `tracing::subscriber::with_default`, and the
-    /// distinction is load-bearing. `tracing` caches per callsite whether anyone is listening.
-    /// `with_default` only redirects the calling thread, so a test running concurrently on
-    /// another thread sees no subscriber, hits the `warn!` in `labels_for`, and re-caches that
-    /// callsite as "nobody is listening" — silently emptying the buffer of whichever test was
-    /// asserting on it. Measured, not theorised: with `with_default` this suite failed 2 runs
-    /// in 30, and adding `rebuild_interest_cache` only narrowed the window rather than closing
-    /// it, because the race is against other threads re-caching afterwards.
-    ///
-    /// A global default is installed for every thread and never removed, so once
-    /// `set_global_default` rebuilds the interest cache the callsite stays enabled for good.
-    /// `main()` installs its own subscriber but is never called under test, so there is no
-    /// conflict over the single global slot.
-    fn log_sink() -> &'static Arc<Mutex<Vec<u8>>> {
-        static LOG_SINK: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
-        LOG_SINK.get_or_init(|| {
-            let buffer = Arc::new(Mutex::new(Vec::new()));
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(CaptureWriter(buffer.clone()))
-                .with_ansi(false)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber)
-                .expect("test binary installs exactly one global subscriber");
-            buffer
-        })
-    }
-
-    /// Everything logged so far, by any test. Assertions must therefore key off values unique
-    /// to the calling test rather than assuming the buffer holds only their own output.
-    fn captured_logs() -> String {
-        let bytes = log_sink().lock().unwrap().clone();
-        String::from_utf8(bytes).expect("log output should be utf-8")
     }
 
     fn label_pairs(labels: &[Label]) -> Vec<(String, String)> {

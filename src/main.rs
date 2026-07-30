@@ -4,6 +4,8 @@ mod consts;
 mod prometheus;
 mod series;
 pub(crate) mod structs;
+#[cfg(test)]
+mod testlog;
 mod writer;
 
 #[macro_use]
