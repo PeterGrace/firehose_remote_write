@@ -1579,6 +1579,62 @@ git commit -m "feat: single writer task owning flush and push (#3)"
 
 ### Task 10: Handler rewrite — no panics, enqueue and respond
 
+> **READ THIS FIRST — the two items below lose data silently and are missing-dependency
+> problems, not logic problems. A perfectly-tested handler still gets them wrong.**
+>
+> **A. Axum's 2 MB body limit vs Firehose's 5 MB buffering → unrecoverable loss.**
+> Axum 0.7's `Json` extractor enforces a 2 MB limit and rejects with **413**. Per the AWS
+> spec, 413 is the ONE status Firehose treats as a permanent failure where the record batch
+> is explicitly **NOT** written to the S3 error bucket. `HttpEndpointBufferingHints.SizeInMBs`
+> defaults to **5** and allows up to **64**. So the default configuration on both sides
+> produces requests axum rejects with the single status code that discards data with no
+> backup and no retry. Set `DefaultBodyLimit::max()` to at least 64 MiB, and never return
+> 413 from this handler for any other reason. Requires adding `tower-http` — it is NOT
+> currently a dependency.
+>
+> **B. Firehose sends `Content-Encoding: gzip` when stream compression is enabled.**
+> Nothing here decompresses it. Every request would fail deserialization → 400 → retried
+> until the retry duration expires → all data to S3 backup. Add
+> `tower_http::decompression::RequestDecompressionLayer`, or document that compression must
+> be disabled on the delivery stream. Prefer the layer.
+>
+> **C. Response contract — only 200 is success.** 201/202/204 are all treated as failures.
+> Every exit path, including extractor rejections, must emit
+> `{"requestId": ..., "timestamp": ...}` as JSON. The `Json<Firehose>` extractor's default
+> rejection is plain text with no `requestId`, which Firehose reads as a 500. Extract
+> `Bytes` and deserialize inside the handler, or install a custom rejection.
+>
+> **D. `timestamp` is epoch MILLISECONDS, not seconds.** The legacy handler used
+> `as_secs()`; an earlier draft of this plan preserved that as "matching what the handler
+> has always returned". That was preserving a latent bug — the AWS response schema
+> specifies milliseconds. Use `as_millis() as u64`.
+>
+> **E. Take `requestId` from the `X-Amz-Firehose-Request-Id` header**, falling back to the
+> body. Firehose treats a missing or mismatched `requestId` as a hard failure even on a 200,
+> and the header is always present and stable across retries. Do not default it to `""`.
+>
+> **F. The metric call sites in the snippets below are STALE.** Task 7 converted
+> `RECORDS_SKIPPED`, `REJECTED_PAYLOADS` and `STREAMS_RECEIVED` to plain `Counter` with a
+> const `instance` label. They no longer have `.with_label_values()`. Use `.inc()`.
+>
+> **G. `state.firehose_arns.write().await` on every request** takes an exclusive lock
+> unconditionally, including the common case where the ARN is already present, serializing
+> all handlers. Read-lock and check membership first; take the write lock only on a miss.
+>
+> **Whole-batch `try_send` is correct** — do not "improve" it to send what fits. Firehose
+> delivery is all-or-nothing with no per-record status, so a partial send followed by a
+> non-200 guarantees duplicate delivery of the accepted prefix. Duplicates are harmless here
+> anyway, because `Accumulator::insert` keys on labels+timestamp and a redelivered datapoint
+> overwrites rather than appends — that property is what makes at-least-once safe, and it is
+> worth stating in the code.
+>
+> **503 vs 500 is cosmetic to Firehose** — 429/503/500/400 are all retried identically with
+> exponential backoff plus jitter, and `Retry-After` is ignored. 503 is the clearest
+> semantic choice. What matters is that it is not 200, not 413, and that the body still
+> conforms: the last `errorMessage` is copied into the S3 error records and is the only
+> post-mortem breadcrumb.
+
+
 **Files:**
 - Modify: `src/main.rs`, `src/structs.rs`
 
