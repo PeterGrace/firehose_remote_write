@@ -7,6 +7,7 @@
 
 use crate::consts::PROM_NAMESPACE;
 use crate::structs::{CloudWatchMetric, MetricUnit};
+use convert_case::{Case, Casing};
 use prometheus_remote_write::{Label, Sample};
 
 /// Strip characters Prometheus does not allow in a metric name component.
@@ -72,6 +73,121 @@ pub fn metric_base_name(metric: &CloudWatchMetric) -> anyhow::Result<String> {
     }
 
     Ok(format!("{PROM_NAMESPACE}_{service}_{name}_{}", metric.unit))
+}
+
+/// Reserved label names we set ourselves. A dimension normalizing onto any of these
+/// would overwrite our own label — `__name__` worst of all, which would clobber the
+/// metric name — so collisions are prefixed instead.
+///
+/// Reachability differs per entry, which matters when reading the tests:
+/// - `account_id` and `metric_stream_name` are reachable end-to-end (`AccountId`,
+///   `MetricStreamName`); this check is the only thing protecting them.
+/// - `region` is unreachable through `labels_for`, because
+///   `DimensionMap::to_labels_values` already remaps it. The redundancy is deliberate, so
+///   it is pinned by a direct unit test rather than a whole-pipeline one.
+/// - `__name__` is unreachable through *any* input: `to_case(Case::Snake)` strips leading
+///   and trailing underscores, so nothing can clean to `__name__`. Kept as defence in
+///   depth in case that normalization ever changes.
+const RESERVED_LABELS: [&str; 4] = ["__name__", "metric_stream_name", "account_id", "region"];
+
+/// Normalize a CloudWatch dimension name into a valid Prometheus label name.
+///
+/// Unlike metric names, label names get no `firehose_` prefix to make them valid, so
+/// every rule has to be enforced here. A label name must match
+/// `[a-zA-Z_][a-zA-Z0-9_]*` — note a leading digit is invalid, which `5xxCode` hits.
+///
+/// Replacement (not deletion) is used here, matching the legacy `to_case(Case::Snake)`
+/// behaviour. This deliberately differs from `sanitize_metric_name`, which deletes for
+/// byte-parity with legacy metric names. Duplicate label names get the entire write
+/// request rejected, so collisions matter far more here than in a metric name.
+///
+/// Returns `None` when the name cannot be salvaged, so the caller can skip the label
+/// rather than emit an invalid one.
+fn label_name_for_dimension(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .to_case(Case::Snake)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    // Nothing usable survived. Note this must test for "all underscores", not just empty:
+    // replacement means `!!!`, `...` and `???` clean to `___`, which is a *technically valid*
+    // Prometheus label name and so would sail past an `is_empty()` check. Emitting it is the
+    // worse outcome of the two — `___` carries no information and every all-punctuation
+    // dimension name collapses onto it, which is the duplicate-label collision that gets the
+    // whole write request rejected. `all()` is vacuously true on the empty string, so this
+    // subsumes the empty case rather than needing a second check.
+    if cleaned.chars().all(|c| c == '_') {
+        return None;
+    }
+
+    // A leading digit is not a valid label name; prefix rather than drop the dimension.
+    let cleaned = if cleaned.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("d_{cleaned}")
+    } else {
+        cleaned
+    };
+
+    if RESERVED_LABELS.contains(&cleaned.as_str()) {
+        return Some(format!("dimension_{cleaned}"));
+    }
+    Some(cleaned)
+}
+
+/// Build the full label set for one sample, sorted by label name.
+///
+/// Labels come straight off the record. Absent dimensions are simply absent:
+/// Prometheus treats an empty label value as equivalent to a missing label, so the
+/// old `""` padding never reached storage.
+pub fn labels_for(metric: &CloudWatchMetric, full_metric_name: &str) -> Vec<Label> {
+    let mut labels = vec![
+        Label {
+            name: "__name__".into(),
+            value: full_metric_name.to_string(),
+        },
+        Label {
+            name: "metric_stream_name".into(),
+            value: metric.metric_stream_name.clone(),
+        },
+        Label {
+            name: "account_id".into(),
+            value: metric.account_id.clone(),
+        },
+        Label {
+            name: "region".into(),
+            value: metric.region.clone(),
+        },
+    ];
+
+    for dim in metric.dimensions.to_labels_values() {
+        let Some(name) = label_name_for_dimension(&dim.key) else {
+            warn!("dropping dimension with unusable name {:?}", dim.key);
+            continue;
+        };
+        labels.push(Label {
+            name,
+            value: dim.value,
+        });
+    }
+
+    // Sorting is a wire requirement, not a nicety, and `DimensionMap` is a `HashMap` so
+    // iteration order is nondeterministic. Sort first so dedup sees duplicates adjacent.
+    labels.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // A duplicate label name gets the ENTIRE write request rejected by the receiver,
+    // killing every good sample batched alongside it. Distinct dimensions can normalize
+    // onto one name (`InstanceId`, `instance_id` and `Instance-Id` all become
+    // `instance_id`), so this is reachable from real input, and because the source is a
+    // HashMap, which one survives is nondeterministic across runs.
+    labels.dedup_by(|a, b| a.name == b.name);
+
+    labels
 }
 
 #[cfg(test)]
@@ -190,5 +306,229 @@ mod tests {
             metric_base_name(&m).unwrap(),
             "firehose_firehose_whatever_count_per_second"
         );
+    }
+
+    fn with_dims(dims: &str) -> CloudWatchMetric {
+        metric_from(&format!(
+            r#"{{"metric_stream_name":"my-stream","account_id":"123456789012",
+                 "region":"us-east-1","namespace":"AWS/ApplicationELB",
+                 "metric_name":"RequestCount","dimensions":{dims},
+                 "timestamp":1700000000000,"value":{{"max":1.0}},"unit":"Count"}}"#
+        ))
+    }
+
+    fn label_pairs(labels: &[Label]) -> Vec<(String, String)> {
+        labels
+            .iter()
+            .map(|l| (l.name.clone(), l.value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn labels_are_sorted_by_name_and_include_name_label() {
+        let m = with_dims(r#"{"LoadBalancer":"app/foo"}"#);
+        let labels = labels_for(&m, "firehose_applicationelb_requestcount_count_max");
+        assert_eq!(
+            label_pairs(&labels),
+            vec![
+                (
+                    "__name__".into(),
+                    "firehose_applicationelb_requestcount_count_max".into()
+                ),
+                ("account_id".into(), "123456789012".into()),
+                ("load_balancer".into(), "app/foo".into()),
+                ("metric_stream_name".into(), "my-stream".into()),
+                ("region".into(), "us-east-1".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rollup_and_specific_records_produce_different_label_sets() {
+        let rollup = labels_for(&with_dims(r#"{"LoadBalancer":"app/foo"}"#), "m");
+        let specific = labels_for(
+            &with_dims(r#"{"LoadBalancer":"app/foo","TargetGroup":"tg/bar"}"#),
+            "m",
+        );
+        assert_ne!(rollup, specific);
+        assert!(specific.iter().any(|l| l.name == "target_group"));
+        assert!(!rollup.iter().any(|l| l.name == "target_group"));
+    }
+
+    #[test]
+    fn dimension_named_region_is_prefixed_to_avoid_collision() {
+        let m = with_dims(r#"{"Region":"eu-west-1"}"#);
+        let labels = labels_for(&m, "m");
+        // Top-level region label survives untouched.
+        assert!(labels
+            .iter()
+            .any(|l| l.name == "region" && l.value == "us-east-1"));
+        // The dimension is renamed rather than overwriting it.
+        assert!(labels
+            .iter()
+            .any(|l| l.name == "dimension_region" && l.value == "eu-west-1"));
+    }
+
+    #[test]
+    fn invalid_characters_in_dimension_names_are_sanitized() {
+        let m = with_dims(r#"{"Some-Weird.Name":"v"}"#);
+        let labels = labels_for(&m, "m");
+        assert!(
+            labels.iter().any(|l| l.name == "some_weird_name"),
+            "got {:?}",
+            label_pairs(&labels)
+        );
+    }
+
+    #[test]
+    fn leading_digit_label_names_are_repaired() {
+        let labels = labels_for(&with_dims(r#"{"5xxCode":"500"}"#), "m");
+        let name = &labels.iter().find(|l| l.value == "500").unwrap().name;
+        assert!(
+            !name.starts_with(|c: char| c.is_ascii_digit()),
+            "leading digit is an invalid Prometheus label name, got {name:?}"
+        );
+    }
+
+    #[test]
+    fn dimensions_colliding_with_reserved_labels_are_prefixed() {
+        let labels = labels_for(&with_dims(r#"{"AccountId":"999"}"#), "m");
+        // Our own account_id must survive untouched.
+        assert!(labels
+            .iter()
+            .any(|l| l.name == "account_id" && l.value == "123456789012"));
+        assert!(labels
+            .iter()
+            .any(|l| l.name == "dimension_account_id" && l.value == "999"));
+    }
+
+    /// `MetricStreamName` is a reachable collision with nothing upstream to catch it: unlike
+    /// `region`, `DimensionMap::to_labels_values` has no special case for it, so
+    /// `RESERVED_LABELS` is the only thing standing between a customer-chosen dimension and
+    /// our own label.
+    #[test]
+    fn dimension_named_metric_stream_name_is_prefixed() {
+        let labels = labels_for(&with_dims(r#"{"MetricStreamName":"evil"}"#), "m");
+        assert!(labels
+            .iter()
+            .any(|l| l.name == "metric_stream_name" && l.value == "my-stream"));
+        assert!(labels
+            .iter()
+            .any(|l| l.name == "dimension_metric_stream_name" && l.value == "evil"));
+    }
+
+    /// Pin the reserved-name check directly, not just through `labels_for`.
+    ///
+    /// `region` cannot reach it end-to-end — `DimensionMap::to_labels_values` remaps a
+    /// `region` dimension before we ever see it — so a pipeline-level test leaves that entry
+    /// free to be deleted unnoticed. The redundancy with `structs.rs` is deliberate: it is
+    /// what makes this function correct in isolation, so it gets its own assertion.
+    #[test]
+    fn label_name_for_dimension_prefixes_reserved_names_in_isolation() {
+        assert_eq!(
+            label_name_for_dimension("region").as_deref(),
+            Some("dimension_region")
+        );
+        assert_eq!(
+            label_name_for_dimension("account_id").as_deref(),
+            Some("dimension_account_id")
+        );
+        assert_eq!(
+            label_name_for_dimension("metric_stream_name").as_deref(),
+            Some("dimension_metric_stream_name")
+        );
+    }
+
+    /// Documents why the `__name__` entry of `RESERVED_LABELS` kills no mutant: snake-casing
+    /// strips leading and trailing underscores, so no input can ever clean to `__name__` and
+    /// the entry is unreachable. If `convert_case` ever stops stripping them, this test flips
+    /// and that entry starts earning its keep — which is exactly when we want to be told.
+    #[test]
+    fn underscore_wrapped_dimension_names_lose_their_underscores() {
+        assert_eq!(
+            label_name_for_dimension("__name__").as_deref(),
+            Some("name")
+        );
+    }
+
+    #[test]
+    fn dimension_named_like_the_name_label_cannot_clobber_the_metric_name() {
+        let labels = labels_for(&with_dims(r#"{"__name__":"evil"}"#), "real_metric_name");
+        assert!(labels
+            .iter()
+            .any(|l| l.name == "__name__" && l.value == "real_metric_name"));
+    }
+
+    #[test]
+    fn unusable_dimension_names_are_dropped_not_emitted_empty() {
+        let labels = labels_for(&with_dims(r#"{"!!!":"v"}"#), "m");
+        assert!(labels.iter().all(|l| !l.name.is_empty()));
+        assert!(labels.iter().all(|l| l.value != "v"));
+    }
+
+    /// The sharp edge behind the "unusable" check, kept separate so it can fail on its own.
+    ///
+    /// Because sanitizing *replaces* rather than deletes, every all-punctuation dimension
+    /// name cleans to the same run of underscores. `___` is a technically valid Prometheus
+    /// label name, so nothing downstream rejects it individually — but three of them in one
+    /// record is a duplicate label name, which gets the entire write request rejected and
+    /// takes every good sample batched alongside it. Dropping is the only safe answer.
+    #[test]
+    fn distinct_all_punctuation_dimension_names_do_not_collapse_onto_one_label() {
+        let labels = labels_for(&with_dims(r#"{"!!!":"a","...":"b","???":"c"}"#), "m");
+        assert!(
+            labels
+                .iter()
+                .all(|l| l.name.chars().any(|c| c.is_ascii_alphanumeric())),
+            "an all-underscore label name carries no information and collides, got {:?}",
+            label_pairs(&labels)
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|l| ["a", "b", "c"].contains(&l.value.as_str())),
+            "got {:?}",
+            label_pairs(&labels)
+        );
+    }
+
+    /// An empty dimension name must not produce an empty label name, which is invalid on the
+    /// wire. Covered by the same guard as the all-punctuation case above.
+    #[test]
+    fn empty_dimension_name_is_dropped() {
+        let labels = labels_for(&with_dims(r#"{"":"v"}"#), "m");
+        assert!(
+            labels.iter().all(|l| !l.name.is_empty() && l.value != "v"),
+            "got {:?}",
+            label_pairs(&labels)
+        );
+    }
+
+    #[test]
+    fn label_names_are_unique_after_normalization() {
+        // All three normalize onto `instance_id`; a duplicate on the wire gets the whole
+        // write request rejected.
+        let labels = labels_for(
+            &with_dims(r#"{"InstanceId":"a","instance_id":"b","Instance-Id":"c"}"#),
+            "m",
+        );
+        let mut names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            before,
+            "duplicate label names would 400 the batch"
+        );
+    }
+
+    #[test]
+    fn labels_are_sorted_regardless_of_hashmap_iteration_order() {
+        let labels = labels_for(&with_dims(r#"{"Zebra":"1","Alpha":"2","Middle":"3"}"#), "m");
+        let names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
     }
 }
