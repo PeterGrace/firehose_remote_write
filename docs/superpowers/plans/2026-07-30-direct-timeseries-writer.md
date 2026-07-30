@@ -1548,10 +1548,20 @@ where
 }
 ```
 
-**Note on the first tick:** `tokio::time::interval` completes its first tick immediately, so
-`run_writer` evaluates `should_flush = true` on the very first loop iteration. `flush`
-returns early when the accumulator is empty, so this is harmless — but do not mistake it for
-the interval having elapsed when reading the tests.
+**Use `interval_at(Instant::now() + period, period)`, NOT `interval(period)`.**
+
+`tokio::time::interval` completes its first tick immediately. I originally wrote here that
+this was "harmless" because `flush` returns early when empty. That is true for correctness
+and false for testability, and the difference was measured, not reasoned:
+
+`select!` picks randomly among *simultaneously* ready branches, but once `rx.recv()` goes
+pending the unconsumed tick-0 is the only ready arm and wins unconditionally. So the writer
+performs one flush of whatever is buffered regardless of the threshold. With `interval`, a
+mutation deleting the threshold check entirely **survived 25 runs out of 25** — the primary
+threshold test could never have failed. With `interval_at` it is killed 25/25.
+
+Nothing observable changes in production (`interval` fires at 0, when there is nothing to
+flush, then at `period`). Everything changes for whether the tests mean anything.
 
 - [ ] **Step 4: Run test to verify it passes**
 
