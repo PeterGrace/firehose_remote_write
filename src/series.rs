@@ -75,19 +75,25 @@ pub fn metric_base_name(metric: &CloudWatchMetric) -> anyhow::Result<String> {
     Ok(format!("{PROM_NAMESPACE}_{service}_{name}_{}", metric.unit))
 }
 
-/// Reserved label names we set ourselves. A dimension normalizing onto any of these
-/// would overwrite our own label — `__name__` worst of all, which would clobber the
-/// metric name — so collisions are prefixed instead.
+/// Reserved label names we set ourselves. A dimension normalizing onto one of these is
+/// prefixed rather than emitted as-is.
+///
+/// What this actually buys is **data preservation**, not protection of our own labels. Our
+/// four are pushed first and `sort_by` is stable, so on a tie they are already the `dedup_by`
+/// survivor — a colliding dimension could never clobber them. Without this check the
+/// dimension's *value* would simply be discarded; with it, the value survives under a
+/// `dimension_`-prefixed name.
 ///
 /// Reachability differs per entry, which matters when reading the tests:
 /// - `account_id` and `metric_stream_name` are reachable end-to-end (`AccountId`,
-///   `MetricStreamName`); this check is the only thing protecting them.
+///   `MetricStreamName`); this check is the only thing keeping their values.
 /// - `region` is unreachable through `labels_for`, because
 ///   `DimensionMap::to_labels_values` already remaps it. The redundancy is deliberate, so
 ///   it is pinned by a direct unit test rather than a whole-pipeline one.
-/// - `__name__` is unreachable through *any* input: `to_case(Case::Snake)` strips leading
-///   and trailing underscores, so nothing can clean to `__name__`. Kept as defence in
-///   depth in case that normalization ever changes.
+/// - `__name__` is unreachable *because `label_name_for_dimension` trims leading and
+///   trailing underscores* — nothing else prevents it. Before that trim existed, `!!name!!`
+///   reached here and came out as `dimension___name__`. Kept as defence in depth precisely
+///   because it is one edit to the normalization away from being reachable again.
 const RESERVED_LABELS: [&str; 4] = ["__name__", "metric_stream_name", "account_id", "region"];
 
 /// Normalize a CloudWatch dimension name into a valid Prometheus label name.
@@ -104,26 +110,31 @@ const RESERVED_LABELS: [&str; 4] = ["__name__", "metric_stream_name", "account_i
 /// Returns `None` when the name cannot be salvaged, so the caller can skip the label
 /// rather than emit an invalid one.
 fn label_name_for_dimension(name: &str) -> Option<String> {
-    let cleaned: String = name
+    // Splitting on every non-alphanumeric run and rejoining with a single `_` does three
+    // jobs at once: replaces invalid characters, collapses runs, and trims the ends.
+    //
+    // The trimming is not cosmetic, and naive per-character replacement is not enough.
+    // `to_case(Case::Snake)` treats underscores as word boundaries but *not* punctuation, so
+    // punctuation survives it and only becomes `_` afterwards. Per-character replacement
+    // therefore let `!!name!!` through as `__name__`, and — because a leading `__` is the
+    // reserved namespace — `//replica//` as `__replica__` and `**tenant_id**` as
+    // `__tenant_id__`. Those are Thanos's and Mimir's own internal labels. They are valid per
+    // the label-name grammar, so nothing downstream rejects them; they simply collide with
+    // system labels. `RESERVED_LABELS` cannot catch that, because these are not names we set.
+    //
+    // Accepted tradeoff: `!!name!!` and `name` now normalize onto the same label and one gets
+    // discarded. That is the ordinary dedup path below, which logs, and is strictly better
+    // than emitting a label in the reserved namespace.
+    let cleaned = name
         .to_case(Case::Snake)
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
 
-    // Nothing usable survived. Note this must test for "all underscores", not just empty:
-    // replacement means `!!!`, `...` and `???` clean to `___`, which is a *technically valid*
-    // Prometheus label name and so would sail past an `is_empty()` check. Emitting it is the
-    // worse outcome of the two — `___` carries no information and every all-punctuation
-    // dimension name collapses onto it, which is the duplicate-label collision that gets the
-    // whole write request rejected. `all()` is vacuously true on the empty string, so this
-    // subsumes the empty case rather than needing a second check.
-    if cleaned.chars().all(|c| c == '_') {
+    // Exactly correct now that the ends are trimmed: an all-punctuation name like `!!!` has
+    // nothing left to join and lands here rather than escaping as a run of underscores.
+    if cleaned.is_empty() {
         return None;
     }
 
@@ -186,8 +197,18 @@ pub fn labels_for(metric: &CloudWatchMetric, full_metric_name: &str) -> Vec<Labe
         });
     }
 
-    // Sorting is a wire requirement, not a nicety, and `DimensionMap` is a `HashMap` so
-    // iteration order is nondeterministic. Sort first so dedup sees duplicates adjacent.
+    // Do NOT delete this as redundant with the encoder. `WriteRequest::encode_compressed`
+    // does sort labels itself, so the wire format is satisfied either way — but this sort is
+    // load-bearing for two things the library does not do:
+    //
+    //  1. `dedup_by` below only removes *adjacent* duplicates, and the library does not
+    //     dedup at all. Unsorted, colliding names slip through and the receiver 400s the
+    //     whole batch.
+    //  2. Task 4 keys its batch accumulator on `Vec<Label>`, where element order determines
+    //     map identity. Unsorted, `DimensionMap`'s nondeterministic `HashMap` order splits
+    //     one logical series across several accumulator entries.
+    //
+    // Removing it keeps almost every test green while silently breaking both.
     labels.sort_by(|a, b| a.name.cmp(&b.name));
 
     // A duplicate label name gets the ENTIRE write request rejected by the receiver,
@@ -531,16 +552,102 @@ mod tests {
         );
     }
 
-    /// Documents why the `__name__` entry of `RESERVED_LABELS` kills no mutant: snake-casing
-    /// strips leading and trailing underscores, so no input can ever clean to `__name__` and
-    /// the entry is unreachable. If `convert_case` ever stops stripping them, this test flips
-    /// and that entry starts earning its keep — which is exactly when we want to be told.
+    /// Documents why the `__name__` entry of `RESERVED_LABELS` kills no mutant — and it is
+    /// *only* the trim in `label_name_for_dimension` that makes it so, not snake-casing.
+    ///
+    /// This was originally recorded as "provably unreachable" on the strength of a surviving
+    /// mutant. That inference was wrong, and expensively so: a surviving mutant means nothing
+    /// is watching the behaviour, never that the behaviour cannot occur. Punctuation is not a
+    /// word boundary for `to_case`, so `!!name!!` survived it intact and became `__name__` in
+    /// the replacement step — see the sibling test below, which is the assertion that was
+    /// missing. Delete the trim and this entry becomes live again.
     #[test]
     fn underscore_wrapped_dimension_names_lose_their_underscores() {
         assert_eq!(
             label_name_for_dimension("__name__").as_deref(),
             Some("name")
         );
+    }
+
+    /// The regression that a surviving mutant hid.
+    ///
+    /// `to_case(Case::Snake)` uses underscores as word boundaries but passes punctuation
+    /// straight through, so before the trim `!!name!!` reached `RESERVED_LABELS` as
+    /// `__name__` and was emitted as `dimension___name__`.
+    #[test]
+    fn punctuation_wrapped_names_do_not_reach_the_reserved_namespace() {
+        assert_eq!(
+            label_name_for_dimension("!!name!!").as_deref(),
+            Some("name")
+        );
+        assert_eq!(
+            label_name_for_dimension("..name..").as_deref(),
+            Some("name")
+        );
+        for input in ["!!name!!", "..name..", "!!abc", "%%foo"] {
+            let got = label_name_for_dimension(input).expect("should salvage a name");
+            assert!(
+                !got.starts_with("__"),
+                "{input:?} produced {got:?}, which is in the reserved `__` namespace"
+            );
+        }
+    }
+
+    /// `__`-prefixed names are valid per the label-name grammar, so nothing downstream
+    /// rejects them — they just collide with system labels. This deployment runs Thanos
+    /// (`__replica__`); Mimir uses `__tenant_id__`. `RESERVED_LABELS` cannot catch these
+    /// because they are not names we set, so the trim is the only thing preventing them.
+    #[test]
+    fn dimension_names_cannot_collide_with_system_reserved_labels() {
+        assert_eq!(
+            label_name_for_dimension("//replica//").as_deref(),
+            Some("replica")
+        );
+        assert_eq!(
+            label_name_for_dimension("**tenant_id**").as_deref(),
+            Some("tenant_id")
+        );
+    }
+
+    /// No emitted label may sit in the `__` namespace, checked end-to-end rather than on the
+    /// helper, since that is what actually reaches the wire. `__name__` is ours and exempt.
+    #[test]
+    fn no_emitted_label_is_in_the_reserved_underscore_namespace() {
+        let labels = labels_for(&with_dims(r#"{"!!abc":"1","//replica//":"2"}"#), "m");
+        for label in &labels {
+            assert!(
+                label.name == "__name__" || !label.name.starts_with("__"),
+                "label {:?} is in the reserved `__` namespace, got {:?}",
+                label.name,
+                label_pairs(&labels)
+            );
+        }
+        assert!(labels.iter().any(|l| l.name == "abc" && l.value == "1"));
+        assert!(labels.iter().any(|l| l.name == "replica" && l.value == "2"));
+    }
+
+    /// Regression guard for the trim: it must not disturb ordinary names.
+    ///
+    /// Deliberately broad — a characterization test over the whole normalizer, since its
+    /// output is a wire contract and *any* drift matters. It therefore fails alongside the
+    /// specific guards' own tests when one of them is broken. That overlap is intended, not a
+    /// discrimination failure: the narrow tests localize the fault, this one notices drift the
+    /// narrow tests were never pointed at.
+    #[test]
+    fn trimming_does_not_alter_well_formed_names() {
+        assert_eq!(
+            label_name_for_dimension("Some-Weird.Name").as_deref(),
+            Some("some_weird_name")
+        );
+        assert_eq!(
+            label_name_for_dimension("InstanceId").as_deref(),
+            Some("instance_id")
+        );
+        assert_eq!(
+            label_name_for_dimension("5xxCode").as_deref(),
+            Some("d_5_xx_code")
+        );
+        assert_eq!(label_name_for_dimension("!!!"), None);
     }
 
     #[test]
@@ -560,11 +667,12 @@ mod tests {
 
     /// The sharp edge behind the "unusable" check, kept separate so it can fail on its own.
     ///
-    /// Because sanitizing *replaces* rather than deletes, every all-punctuation dimension
-    /// name cleans to the same run of underscores. `___` is a technically valid Prometheus
-    /// label name, so nothing downstream rejects it individually — but three of them in one
-    /// record is a duplicate label name, which gets the entire write request rejected and
-    /// takes every good sample batched alongside it. Dropping is the only safe answer.
+    /// Sanitizing replaces rather than deletes, so every all-punctuation dimension name
+    /// reduces to nothing once the ends are trimmed. Before the trim they became `___` — a
+    /// technically valid Prometheus label name that nothing downstream would reject
+    /// individually, but three of them in one record is a duplicate label name, which gets
+    /// the entire write request rejected and takes every good sample batched alongside it.
+    /// Dropping is the only safe answer.
     #[test]
     fn distinct_all_punctuation_dimension_names_do_not_collapse_onto_one_label() {
         let labels = labels_for(&with_dims(r#"{"!!!":"a","...":"b","???":"c"}"#), "m");
