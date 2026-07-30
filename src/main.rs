@@ -14,27 +14,67 @@ extern crate tracing;
 extern crate anyhow;
 
 use crate::aws::get_freshness;
-use crate::prometheus::{push_firehose_metrics, record_metric, FRESHNESS_INFO, STREAMS_RECEIVED};
-use crate::structs::SharedState;
+use crate::config::Config;
+use crate::prometheus::{
+    FRESHNESS_INFO, RECORDS_SKIPPED, REJECTED_PAYLOADS, STREAMS_RECEIVED, TOTAL_WRITES_SENT,
+};
+use crate::series::to_series;
 use crate::structs::{AppState, FirehoseData, FirehoseResponse};
-use crate::structs::{CloudWatchMetric, Firehose, MetricUnit, MetricValue};
-use ::prometheus::core::Metric;
-use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::header::CONTENT_TYPE;
+use crate::structs::{CloudWatchMetric, Firehose};
+use crate::writer::run_writer;
+use axum::body::{Body, Bytes};
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post};
-use axum::{debug_handler, extract, Json, Router};
-use base64::decode;
+use axum::routing::post;
+use axum::{debug_handler, Json, Router};
 use base64::prelude::*;
-use serde::Deserialize;
+use prometheus_remote_write::{Label, Sample};
 use std::env;
-use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
-use tokio::time::{interval, Instant};
+use tokio::time::interval;
+use tower_http::decompression::RequestDecompressionLayer;
+use tower_http::map_request_body::MapRequestBodyLayer;
 use tracing_subscriber::EnvFilter;
+
+/// The largest request body this endpoint will buffer, **after** decompression.
+///
+/// This constant exists because two products' defaults compose into silent, unrecoverable
+/// data loss, and neither side looks wrong on its own:
+///
+/// * axum's `DefaultBodyLimit` is **2 MiB** and applies to every extractor that goes through
+///   `Bytes` -- which is `Bytes`, `String`, `Json` and `Form` alike, so switching extractor
+///   does not escape it.
+/// * `HttpEndpointBufferingHints.SizeInMBs` defaults to **5** and may be set as high as 64.
+///
+/// So an untouched delivery stream pointed at an untouched axum server produces requests the
+/// server rejects. That would merely be an outage, except for *which* status axum rejects
+/// with: 413. Per the AWS specification, "Response code 413 (size exceeded) is considered as
+/// a permanent failure and the record batch is **not sent to error bucket** if configured."
+/// It is the only status with that property -- everything else in 2xx/4xx/5xx is either
+/// success or a retryable error that eventually reaches the S3 backup. A 413 destroys the
+/// batch with no retry and no copy.
+///
+/// 64 MiB is the documented ceiling on the request body ("can be up to a maximum of 64 MiB,
+/// before compression"), so a limit at that value cannot be reached by a conforming sender.
+/// It is measured against the *decompressed* body because the extractor sits inside the
+/// decompression layer, which is also the direction that keeps a compression bomb bounded.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// What we put in `requestId` when neither the header nor the body carried one.
+///
+/// There is no correct value here. The response schema makes `requestId` required and says
+/// it "must match the requestId in the request", so when the request has none, *no* response
+/// can conform -- and a non-conforming response is treated by Firehose as a 500 with no body.
+/// Defaulting to `""` merely hides that behind something that reads like a real value in a
+/// log. A visible sentinel says which of the two failure modes happened, and pairs with the
+/// 400 and the `errorMessage` that accompany it.
+///
+/// Reaching this from Firehose itself should be impossible: `requestId` is `required` in the
+/// request schema and duplicated into the `X-Amz-Firehose-Request-Id` header. It is reachable
+/// from anything else that POSTs here, which is why it must not panic.
+const MISSING_REQUEST_ID: &str = "missing-request-id";
 
 #[tokio::main]
 async fn main() {
@@ -47,22 +87,48 @@ async fn main() {
         .with_line_number(true)
         .init();
 
-    let shared_state = SharedState::default();
-    {
-        let mut state = shared_state.write().await;
-        *state = AppState::default();
-    }
+    let config = Config::from_env();
+    let addr = env::var("PROM_WRITE_ADDR").expect("Can't push without PROM_WRITE_ADDR defined");
+    let url = format!("{addr}/api/v1/write");
+    let (tx, rx) = tokio::sync::mpsc::channel(config.channel_capacity);
+    let state = AppState::new(tx);
 
-    let app = Router::new()
-        .route("/", post(get_firehose).put(get_firehose))
-        .with_state(Arc::clone(&shared_state));
+    let client = reqwest::Client::new();
+    tokio::spawn(run_writer(rx, config.clone(), move |body| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let rs = client.post(url).body(body).send().await?;
+            let status = rs.status().as_u16();
+            TOTAL_WRITES_SENT
+                .with_label_values(&[&status.to_string()])
+                .inc();
+            if status == 400 {
+                error!(
+                    "400 from remote write: {}",
+                    rs.text().await.unwrap_or_default()
+                );
+            }
+            Ok(status)
+        }
+    }));
+
+    // The freshness task is handed the ARN set alone, NOT a clone of `AppState`.
+    //
+    // `AppState` owns a `Sender`, and `run_writer` only reaches its shutdown-drain arm once
+    // *every* `Sender` has dropped. This task loops forever, so a clone of `AppState` parked
+    // inside it would keep one alive for the life of the process -- making the drain
+    // unreachable and quietly discarding the buffer's tail on every shutdown. Task 11 wires
+    // the graceful shutdown that depends on this.
+    let firehose_arns = Arc::clone(&state.firehose_arns);
+    let app = app(state);
 
     tokio::spawn(async move {
         let mut interval = interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
             // Check discovered firehose arns and check their freshness
-            let firehose_arns = shared_state.read().await.firehose_arns.clone();
+            let firehose_arns = firehose_arns.read().await.clone();
             for firehose_arn in firehose_arns.iter() {
                 if let Ok(freshness) = get_freshness(firehose_arn.clone()).await {
                     info!("Freshness for {firehose_arn}: {freshness}");
@@ -71,137 +137,1257 @@ async fn main() {
                         .set(freshness);
                 }
             }
-            println!("Running scheduled task");
         }
     });
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     info!("Spawning axum listener.");
     axum::serve(listener, app).await.unwrap();
-    loop {}
 }
 
-async fn decode_payloads(records: Vec<FirehoseData>) -> Result<String, Box<dyn Error>> {
-    let payload_message = records
-        .iter()
-        .map(|s| String::from_utf8(BASE64_STANDARD.decode(&s.data).unwrap()).unwrap())
-        .collect::<Vec<String>>()
-        .join("");
-    Ok(payload_message)
-}
-pub async fn convert_to_cloudmetric(input: &str) -> Result<CloudWatchMetric, StatusCode> {
-    let metric: CloudWatchMetric = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(e) => {
-            println!("Can't process metric: {e}");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
-    Ok(metric)
+/// The real router, layers and all.
+///
+/// Tests drive *this*, not `get_firehose` directly, because two of the three ways this
+/// endpoint silently loses data live in the layers rather than in the handler: the body
+/// limit and the gzip decoding. A test that called the handler function would pass with both
+/// removed.
+pub fn app(state: AppState) -> Router {
+    app_with_body_limit(state, MAX_BODY_BYTES)
 }
 
-#[debug_handler]
-async fn get_firehose(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    Json(payload): Json<Firehose>,
-) -> Result<Json<FirehoseResponse>, (StatusCode, Json<FirehoseResponse>)> {
-    let mut payload_message: String = String::from("");
+/// [`app`] with the body limit as a parameter, so a test can prove what happens when the
+/// limit is exceeded without allocating 64 MiB to do it.
+///
+/// # Layer order is load-bearing
+///
+/// `.layer()` calls stack outward, so the last one added is the outermost. The request
+/// therefore passes through `DefaultBodyLimit` (which only records the limit as an extension
+/// for the extractor to read), then decompression, then the body-type remap, then the route.
+///
+/// `MapRequestBodyLayer` is not decoration: `RequestDecompression<S>` hands its inner service
+/// a `Request<DecompressionBody<B>>`, and axum's `Route` accepts only `Request<Body>`. The
+/// remap is what makes the two typecheck against each other.
+///
+/// Because the limit is applied by the *extractor*, it is measured against the decompressed
+/// body. That is the safe direction -- a compressed payload that expands past the limit is
+/// cut off rather than buffered whole -- and it is measured rather than assumed, by
+/// `the_body_limit_is_measured_after_decompression`.
+///
+/// `pass_through_unaccepted(true)` matters for the same reason every other exit path in this
+/// file does. Left at its default, an unsupported `Content-Encoding` makes the layer answer
+/// 415 with a plain-text body and no `requestId`, which Firehose reads as "500 with no body"
+/// -- a retry with no explanation attached. Passing it through instead lets the handler
+/// answer with a conforming body that names the encoding it could not decode.
+fn app_with_body_limit(state: AppState, limit: usize) -> Router {
+    Router::new()
+        .route("/", post(get_firehose).put(get_firehose))
+        .layer(MapRequestBodyLayer::new(Body::new))
+        .layer(
+            RequestDecompressionLayer::new()
+                .gzip(true)
+                .pass_through_unaccepted(true),
+        )
+        .layer(DefaultBodyLimit::max(limit))
+        .with_state(state)
+}
 
-    if let Some(source_arn) = headers.get("X-Amz-Firehose-Source-Arn") {
-        state.write().await.firehose_arns.insert(source_arn.to_str().unwrap().to_string());
-
-    } else if let Some(firehose) = payload.source_arn {
-        state.write().await.firehose_arns.insert(firehose);
-    } else {
-        warn!("Could not find source arn in headers or payload for this request.")
-    }
-    
-    if let Some(records) = payload.records {
-        // although it's not beyond belief that amazon would send us malformed b64, it's unlikely,
-        // so I'm skipping error processing here for now
-        payload_message = decode_payloads(records).await.unwrap_or_default();
-    };
-
-    if let Some(message) = payload.message {
-        payload_message = message;
-    }
-
-    for line in payload_message.lines() {
-        trace!("Processing {line}");
-        if let Ok(metric) = convert_to_cloudmetric(line).await {
-            if let Err(e) = record_metric(metric).await {
-                error!("Couldn't record_metric: {e}");
+/// Decode Firehose records, skipping any that are malformed.
+///
+/// Not `async`, and not fallible. Both are deliberate. There is no I/O here, and there is no
+/// error worth returning: a single bad record must not fail the batch, because the only way
+/// to fail a batch is a non-200, and a non-200 makes Firehose replay *everything* -- the
+/// records that decoded fine along with the one that did not. If the bad record is
+/// permanently bad, that replay never terminates on its own; it just runs until the retry
+/// window expires, having re-delivered the good records every time.
+///
+/// Records are concatenated, not joined with a separator: CloudWatch metric streams in JSON
+/// format already terminate each record with a newline, and inserting another would produce
+/// blank lines that `parse_lines` would then have to skip.
+fn decode_payloads(records: Vec<FirehoseData>) -> String {
+    let mut out = String::new();
+    for record in records {
+        let bytes = match BASE64_STANDARD.decode(&record.data) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("skipping record with invalid base64: {e}");
+                RECORDS_SKIPPED.inc();
                 continue;
             }
-        } else {
-            debug!("unable to decode cloudmetric");
-        }
-    }
-    STREAMS_RECEIVED.inc();
-    match push_firehose_metrics().await {
-        Ok(_) => {
-            let response = FirehoseResponse {
-                request_id: payload.request_id.unwrap(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as u64,
-                error_message: None,
-            };
-            debug!("succeeded on push: {response:#?}");
-            Ok(Json(response))
-        }
-        Err(e) => {
-            if e.to_string().contains("too old sample") {
-                let response = FirehoseResponse {
-                    request_id: payload.request_id.unwrap(),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as u64,
-                    error_message: None,
-                };
-                warn!("Received old samples, still telling AWS we're ok to proceed{response:#?}");
-                Ok(Json(response))
-            } else {
-                let msg = format!("Failed to push metrics: {e}");
-                let response = FirehoseResponse {
-                    request_id: payload.request_id.unwrap(),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as u64,
-                    error_message: Some(msg),
-                };
-                error!("{response:#?}");
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(response),
-                ))
-
+        };
+        match String::from_utf8(bytes) {
+            Ok(s) => out.push_str(&s),
+            Err(e) => {
+                debug!("skipping record with invalid utf-8: {e}");
+                RECORDS_SKIPPED.inc();
             }
         }
     }
+    out
 }
-use crate::aws::AWSState;
-#[cfg(test)]
-use std::fs::File;
-use std::io::Read;
-use tokio::time;
 
-#[tokio::test]
-async fn test_convert_to_labels_values() {
-    let mut data: String = Default::default();
-    let mut fd: File = File::open("testdata/just-post-payload.json").unwrap();
-    let buffer = fd.read_to_string(&mut data).unwrap();
-    let payload = serde_json::from_str::<Firehose>(&data).unwrap();
-    // begin: Json(payload): Json<Firehose>
-    if let Some(records) = payload.records {
-        let payload_str = decode_payloads(records).await.unwrap();
-        for line in payload_str.lines() {
-            let cm = convert_to_cloudmetric(&line).await.unwrap();
-            println!("{:#?}", cm.dimensions.to_labels_values());
+/// Parse newline-delimited CloudWatch metric JSON into remote-write samples.
+///
+/// `now_ms` is a parameter rather than a clock read, so that every record in one payload is
+/// judged against one reading. Reading the clock per record would put a batch's records on
+/// either side of the freshness window boundary depending on how long the batch took to
+/// parse -- a decision that has nothing to do with the data.
+///
+/// `to_series` fails only for per-record, non-retryable conditions (a namespace or metric
+/// name with nothing usable in it). Those are logged and skipped for the same reason bad
+/// base64 is: `?`-ing one out of the handler would fail the delivery and replay the batch.
+fn parse_lines(text: &str, now_ms: i64) -> Vec<(Vec<Label>, Sample)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
         }
+        let metric: CloudWatchMetric = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!("skipping unparseable line: {e}");
+                RECORDS_SKIPPED.inc();
+                continue;
+            }
+        };
+        match to_series(&metric, now_ms) {
+            Ok(series) => out.extend(series),
+            Err(e) => {
+                debug!("skipping record: {e}");
+                RECORDS_SKIPPED.inc();
+            }
+        }
+    }
+    out
+}
+
+/// Trim a candidate id and discard it if nothing is left.
+///
+/// A present-but-empty `requestId` is indistinguishable from an absent one for the only
+/// purpose the value has -- Firehose matching it against what it sent -- so it is treated as
+/// absent and reported as such, rather than echoed back as `""`.
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// The `requestId`, header first.
+///
+/// The header is authoritative: the body copy is documented as being there "for
+/// convenience", the header "is kept the same between multiple attempts of the same
+/// request", and it survives a body we could not parse at all -- which is exactly when a
+/// correctly-addressed error response is worth the most.
+///
+/// `to_str` fails on any non-visible-ASCII byte. That is a `Result` the legacy handler
+/// `unwrap`ped; here it degrades to the body copy, because a header we cannot read is not a
+/// reason to panic a request that may be otherwise perfectly good.
+fn request_id_from_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("X-Amz-Firehose-Request-Id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(non_empty)
+}
+
+/// The source ARN, header first, body second -- same reasoning, same `to_str` care.
+fn source_arn_from(headers: &HeaderMap, payload: &Firehose) -> Option<String> {
+    headers
+        .get("X-Amz-Firehose-Source-Arn")
+        .and_then(|v| v.to_str().ok())
+        .and_then(non_empty)
+        .or_else(|| payload.source_arn.as_deref().and_then(non_empty))
+}
+
+/// A `Content-Encoding` still on the request means the decompression layer did **not**
+/// handle it -- it strips the header when it decodes -- so whatever we are holding is not
+/// the JSON the sender thinks it sent.
+fn undecoded_content_encoding(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .and_then(non_empty)
+        .filter(|v| !v.eq_ignore_ascii_case("identity"))
+}
+
+/// Record the ARN we are receiving from, taking the exclusive lock only when it is new.
+///
+/// The previous version took `write()` unconditionally on every request, which serialised
+/// every concurrent handler behind one exclusive acquisition in order to re-insert a value
+/// that was already there. The set converges after the first request from each delivery
+/// stream and then never changes again, so the write path is effectively startup-only while
+/// the read path is per-request.
+///
+/// The read guard is dropped before the write is attempted -- `tokio::sync::RwLock` is not
+/// reentrant, and upgrading in place by holding both would deadlock the handler against
+/// itself. The gap between the two means two requests carrying the same new ARN can both
+/// decide to write; `HashSet::insert` makes that idempotent.
+async fn remember_source_arn(state: &AppState, arn: String) {
+    if state.firehose_arns.read().await.contains(&arn) {
+        return;
+    }
+    state.firehose_arns.write().await.insert(arn);
+}
+
+/// Accept a Firehose delivery, or say precisely why not.
+///
+/// # Every exit from this function returns the same body shape
+///
+/// `{"requestId": ..., "timestamp": ...}` plus an `errorMessage` on failure, as
+/// `application/json`. That is not tidiness: "If a response fails to conform to the
+/// requirements below, the Firehose server treats it as though it had a 500 status code with
+/// no body", and **only 200 counts as success** -- 201, 202 and 204 are failures. The
+/// `Json<Firehose>` extractor's own rejection is plain text with no `requestId`, so the body
+/// is extracted as `Bytes` and deserialised here where a failure can still be answered
+/// properly.
+///
+/// # Nothing here may panic
+///
+/// The legacy handler `unwrap`ped four things reachable from a single malformed request:
+/// `payload.request_id`, the base64 decode, the UTF-8 conversion, and `HeaderValue::to_str`.
+/// A panic in a handler is a dropped connection, which Firehose retries -- so a permanently
+/// malformed record does not fail once, it fails forever, and takes the rest of its batch
+/// with it every time.
+///
+/// # Which failures get which status
+///
+/// Firehose treats 429, 500, 503 and 400 identically: retry with exponential backoff and
+/// jitter, `Retry-After` ignored, then the S3 error bucket once the window expires. So the
+/// status is chosen for the operator reading it, with two hard rules: never 413 (the batch
+/// would be destroyed rather than backed up), and never a non-200 2xx (read as failure but
+/// with no diagnostic).
+#[debug_handler]
+async fn get_firehose(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> (StatusCode, Json<FirehoseResponse>) {
+    STREAMS_RECEIVED.inc();
+
+    // Resolved before anything that can fail, so an unreadable body still gets an addressed
+    // reply. AWS asks endpoints to log this "for both successful and unsuccessful requests".
+    let header_request_id = request_id_from_header(&headers);
+
+    let body = match body {
+        Ok(b) => b,
+        Err(rejection) => {
+            // NOT `rejection.status()`. For a body over the limit that is 413, and 413 is the
+            // one status where Firehose gives up permanently *and* skips the S3 error bucket.
+            // 500 is retried and then backed up, so the batch survives our refusal to read
+            // it. The `errorMessage` is what tells the operator to lower `SizeInMBs`.
+            let message = format!(
+                "could not read request body ({}); the endpoint accepts up to {MAX_BODY_BYTES} \
+                 bytes uncompressed",
+                rejection.body_text()
+            );
+            error!("request {header_request_id:?}: {message}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(FirehoseResponse::error(
+                    header_request_id.unwrap_or_else(|| MISSING_REQUEST_ID.to_string()),
+                    message,
+                )),
+            );
+        }
+    };
+
+    let mut payload: Firehose = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            let message = match undecoded_content_encoding(&headers) {
+                Some(encoding) => format!(
+                    "request body is Content-Encoding: {encoding}, which this endpoint cannot \
+                     decode (only gzip and identity); disable compression on the delivery \
+                     stream or use gzip"
+                ),
+                None => format!("request body is not a Firehose JSON document: {e}"),
+            };
+            error!("request {header_request_id:?}: {message}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(FirehoseResponse::error(
+                    header_request_id.unwrap_or_else(|| MISSING_REQUEST_ID.to_string()),
+                    message,
+                )),
+            );
+        }
+    };
+
+    let request_id =
+        header_request_id.or_else(|| payload.request_id.as_deref().and_then(non_empty));
+
+    match source_arn_from(&headers, &payload) {
+        Some(arn) => remember_source_arn(&state, arn).await,
+        None => warn!("no source arn in headers or payload for this request"),
+    }
+
+    let mut text = payload
+        .records
+        .take()
+        .map(decode_payloads)
+        .unwrap_or_default();
+    // Pre-existing convenience path for hand-made requests; not part of the AWS schema.
+    if let Some(message) = payload.message.take() {
+        text = message;
+    }
+
+    // Read once for the whole batch, then threaded through. See `parse_lines`.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let series = parse_lines(&text, now_ms);
+
+    // Whole batch or nothing, and deliberately not "send what fits".
+    //
+    // Firehose delivery is all-or-nothing: there is no per-record status in the response, so
+    // a partial accept followed by a non-200 tells the sender to replay the entire batch,
+    // guaranteeing that the accepted prefix arrives twice. The duplicate itself is harmless
+    // -- `Accumulator::insert` keys on labels plus timestamp and overwrites rather than
+    // appends, so a redelivered datapoint replaces its earlier copy instead of becoming an
+    // out-of-order sample. That property is precisely what makes at-least-once delivery safe
+    // here, and it is worth not depending on it more than necessary.
+    if !series.is_empty() {
+        if let Err(e) = state.tx.try_send(series) {
+            REJECTED_PAYLOADS.inc();
+            let message = format!("write buffer full, retry this batch: {e}");
+            warn!("request {request_id:?}: {message}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(FirehoseResponse::error(
+                    request_id.unwrap_or_else(|| MISSING_REQUEST_ID.to_string()),
+                    message,
+                )),
+            );
+        }
+    }
+
+    match request_id {
+        Some(request_id) => {
+            debug!("accepted request {request_id}");
+            (StatusCode::OK, Json(FirehoseResponse::ok(request_id)))
+        }
+        // The records above were still enqueued: they parsed, and discarding data we already
+        // hold buys nothing. But the response cannot be a success, because a `requestId` that
+        // does not match makes even a 200 count as a failure -- so say what is wrong instead
+        // of pretending. See [`MISSING_REQUEST_ID`].
+        None => {
+            let message = "no requestId in the X-Amz-Firehose-Request-Id header or the request \
+                           body; it is required in both";
+            warn!("{message}");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(FirehoseResponse::error(
+                    MISSING_REQUEST_ID.to_string(),
+                    message,
+                )),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testlog::LogTail;
+    use axum::body::to_bytes;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::http::Request;
+    use serde_json::Value;
+    use std::io::Write;
+    use tokio::sync::mpsc::{channel, Receiver};
+    use tower::ServiceExt;
+
+    const NOW: i64 = 1_700_000_000_000;
+    const REQ_ID: &str = "ed4acda5-034f-9f42-bba1-f29aea6d7d8f";
+
+    type Batch = Vec<(Vec<Label>, Sample)>;
+
+    fn record(payload: &str) -> FirehoseData {
+        FirehoseData {
+            data: BASE64_STANDARD.encode(payload),
+        }
+    }
+
+    /// One well-formed CloudWatch metric-stream line, timestamped `NOW` so it lands inside
+    /// the freshness window whatever the wall clock says.
+    fn metric_line(name: &str, timestamp: i64) -> String {
+        format!(
+            r#"{{"metric_stream_name":"s","account_id":"1","region":"us-east-1",
+                "namespace":"AWS/Test","metric_name":"{name}","dimensions":{{}},
+                "timestamp":{timestamp},"value":{{"max":1.0}},"unit":"Count"}}"#
+        )
+        .replace('\n', "")
+    }
+
+    /// One well-formed record, stamped with the wall clock.
+    ///
+    /// Tests that go through the handler cannot use a fixed timestamp: the handler reads the
+    /// real clock and `to_series` drops anything more than 24 hours old, so a hard-coded
+    /// `NOW` silently produces an empty batch and every "the data was enqueued" assertion
+    /// starts failing on a date that has nothing to do with the code. Tests calling
+    /// `parse_lines` directly pass `NOW` for both sides and are unaffected.
+    fn fresh_line() -> String {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        format!("{}\n", metric_line("M", now_ms))
+    }
+
+    fn state_with_capacity(capacity: usize) -> (AppState, Receiver<Batch>) {
+        let (tx, rx) = channel(capacity);
+        (AppState::new(tx), rx)
+    }
+
+    /// A request body carrying `records`, each already base64-encoded.
+    fn firehose_body(records: &[&str]) -> String {
+        let encoded: Vec<String> = records
+            .iter()
+            .map(|r| format!(r#"{{"data":"{}"}}"#, BASE64_STANDARD.encode(r)))
+            .collect();
+        format!(
+            r#"{{"requestId":"{REQ_ID}","timestamp":{NOW},"records":[{}]}}"#,
+            encoded.join(",")
+        )
+    }
+
+    fn post() -> axum::http::request::Builder {
+        Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(CONTENT_TYPE, "application/json")
+    }
+
+    /// Status plus the parsed JSON body, which is what every assertion below is about.
+    async fn call(app: Router, request: Request<Body>) -> (StatusCode, Value, String) {
+        let response = app.oneshot(request).await.expect("router is infallible");
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "every response must be a conforming JSON body, got {:?}: {e}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, json, content_type)
+    }
+
+    /// The shape AWS requires of every response, asserted in one place so no exit path can
+    /// quietly stop conforming.
+    fn assert_conforming(status: StatusCode, body: &Value, content_type: &str) {
+        assert_eq!(
+            content_type, "application/json",
+            "the only acceptable content type is application/json"
+        );
+        assert!(
+            body.get("requestId").and_then(Value::as_str).is_some(),
+            "requestId is required in the response schema, got {body}"
+        );
+        let timestamp = body
+            .get("timestamp")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("timestamp is required and must be an integer: {body}"));
+        assert!(
+            timestamp > 1_600_000_000_000,
+            "timestamp must be epoch MILLISECONDS; {timestamp} is ~1000x too small, which is \
+             what `as_secs()` produces"
+        );
+        assert_ne!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "413 is the one status where Firehose destroys the batch without an S3 backup"
+        );
+        if status != StatusCode::OK {
+            assert!(
+                status.is_client_error() || status.is_server_error(),
+                "a non-200 2xx is read as a failure with no diagnostic, got {status}"
+            );
+            assert!(
+                body.get("errorMessage")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| !m.is_empty()),
+                "errorMessage is the only post-mortem breadcrumb copied to the S3 error \
+                 bucket, got {body}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // decode_payloads
+    // -------------------------------------------------------------------------------------
+
+    #[test]
+    fn decode_payloads_skips_malformed_base64_and_keeps_going() {
+        let _log = LogTail::start();
+        let before = RECORDS_SKIPPED.get();
+
+        let decoded = decode_payloads(vec![
+            record("first\n"),
+            FirehoseData {
+                data: String::from("!!!not base64!!!"),
+            },
+            record("third\n"),
+        ]);
+
+        assert!(decoded.contains("first"), "got {decoded:?}");
+        assert!(decoded.contains("third"), "got {decoded:?}");
+        assert_eq!(
+            RECORDS_SKIPPED.get(),
+            before + 1.0,
+            "the skipped record must be counted"
+        );
+    }
+
+    #[test]
+    fn decode_payloads_skips_invalid_utf8() {
+        let _log = LogTail::start();
+        let before = RECORDS_SKIPPED.get();
+
+        let decoded = decode_payloads(vec![
+            FirehoseData {
+                // Valid base64, but 0xff is not valid UTF-8 in any position.
+                data: BASE64_STANDARD.encode([0xff, 0xfe, 0xfd]),
+            },
+            record("good\n"),
+        ]);
+
+        assert!(decoded.contains("good"), "got {decoded:?}");
+        assert_eq!(RECORDS_SKIPPED.get(), before + 1.0);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // parse_lines
+    // -------------------------------------------------------------------------------------
+
+    #[test]
+    fn parse_lines_skips_malformed_json_and_returns_valid_series() {
+        let _log = LogTail::start();
+        let before = RECORDS_SKIPPED.get();
+
+        let text = format!("{{not json}}\n{}\n", metric_line("M", NOW));
+        let series = parse_lines(&text, NOW);
+
+        assert_eq!(series.len(), 1, "the good line must survive the bad one");
+        assert_eq!(RECORDS_SKIPPED.get(), before + 1.0);
+    }
+
+    /// `to_series` is fallible, and its failures are per-record and permanent -- a namespace
+    /// with no `/` can never become parseable. Propagating one would fail the delivery, and
+    /// Firehose would replay the same unparseable record forever.
+    #[test]
+    fn parse_lines_skips_records_that_to_series_rejects() {
+        let _log = LogTail::start();
+        let before = RECORDS_SKIPPED.get();
+
+        // "NoSlash" has no service segment, which is exactly what `metric_base_name` bails on.
+        let bad =
+            metric_line("M", NOW).replace(r#""namespace":"AWS/Test""#, r#""namespace":"NoSlash""#);
+        assert!(
+            bad.contains("NoSlash"),
+            "test setup: the substitution must apply"
+        );
+        let text = format!("{bad}\n{}\n", metric_line("Good", NOW));
+
+        let series = parse_lines(&text, NOW);
+
+        assert_eq!(
+            series.len(),
+            1,
+            "the batch must survive one rejected record"
+        );
+        assert_eq!(RECORDS_SKIPPED.get(), before + 1.0);
+    }
+
+    /// The clock is read once per batch and threaded in. Without the parameter actually
+    /// reaching `to_series`, a record dated `NOW` would be judged against the wall clock --
+    /// which for a fixed test timestamp is years of drift, so this is a real detector rather
+    /// than a restatement of the signature.
+    #[test]
+    fn parse_lines_judges_every_record_against_the_now_ms_it_was_given() {
+        let _log = LogTail::start();
+        let text = format!("{}\n{}\n", metric_line("A", NOW), metric_line("B", NOW));
+
+        assert_eq!(parse_lines(&text, NOW).len(), 2, "both are fresh at NOW");
+        assert!(
+            parse_lines(&text, NOW + 48 * 60 * 60 * 1000).is_empty(),
+            "two days later the same records are outside the window"
+        );
+    }
+
+    #[test]
+    fn parse_lines_ignores_blank_lines() {
+        let _log = LogTail::start();
+        let before = RECORDS_SKIPPED.get();
+        let text = format!("\n\n{}\n\n   \n", metric_line("M", NOW));
+
+        assert_eq!(parse_lines(&text, NOW).len(), 1);
+        assert_eq!(
+            RECORDS_SKIPPED.get(),
+            before,
+            "a blank line is not a skipped record"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------
+    // requestId resolution
+    // -------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_request_id_comes_from_the_header_and_the_response_echoes_it() {
+        let _log = LogTail::start();
+        let (state, mut rx) = state_with_capacity(4);
+        let body = firehose_body(&[&fresh_line()]);
+
+        let (status, json, content_type) = call(
+            app(state),
+            post()
+                .header("X-Amz-Firehose-Request-Id", "header-id")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(
+            json["requestId"], "header-id",
+            "the header wins over the body copy"
+        );
+        assert!(json.get("errorMessage").is_none(), "a 200 carries no error");
+        assert_eq!(rx.try_recv().expect("the batch must be enqueued").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_request_id_falls_back_to_the_body_when_the_header_is_absent() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        let body = firehose_body(&[&fresh_line()]);
+
+        let (status, json, content_type) =
+            call(app(state), post().body(Body::from(body)).unwrap()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(json["requestId"], REQ_ID);
+    }
+
+    /// `HeaderValue::to_str` returns `Err` for any byte outside visible ASCII, and the legacy
+    /// handler `unwrap`ped it. A header a proxy mangled is not a reason to panic a request
+    /// whose body is perfectly good.
+    #[tokio::test]
+    async fn a_non_ascii_header_value_does_not_panic_and_falls_back_to_the_body() {
+        let _log = LogTail::start();
+        let (state, mut rx) = state_with_capacity(4);
+        let body = firehose_body(&[&fresh_line()]);
+
+        let request = post()
+            .header(
+                "X-Amz-Firehose-Request-Id",
+                axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+            )
+            .header(
+                "X-Amz-Firehose-Source-Arn",
+                axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+            )
+            .body(Body::from(body))
+            .unwrap();
+
+        let (status, json, content_type) = call(app(state), request).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(json["requestId"], REQ_ID, "the body copy is still usable");
+        assert_eq!(rx.try_recv().expect("the batch survives").len(), 1);
+    }
+
+    /// Neither source carries one. The legacy handler called `.unwrap()` on this and panicked.
+    #[tokio::test]
+    async fn a_missing_request_id_everywhere_does_not_panic_and_still_conforms() {
+        let _log = LogTail::start();
+        let (state, mut rx) = state_with_capacity(4);
+        let line = fresh_line();
+        let body = format!(
+            r#"{{"records":[{{"data":"{}"}}]}}"#,
+            BASE64_STANDARD.encode(&line)
+        );
+
+        let (status, json, content_type) =
+            call(app(state), post().body(Body::from(body)).unwrap()).await;
+
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "no requestId can be matched, so this cannot be reported as success"
+        );
+        assert_eq!(json["requestId"], MISSING_REQUEST_ID);
+        assert!(
+            json["errorMessage"]
+                .as_str()
+                .unwrap()
+                .contains("X-Amz-Firehose-Request-Id"),
+            "the message must name what was missing, got {json}"
+        );
+        assert_eq!(
+            rx.try_recv().expect("parsed records are still kept").len(),
+            1,
+            "discarding data we already hold buys nothing"
+        );
+    }
+
+    /// An empty string is not a usable id: it can never match what Firehose sent, and echoing
+    /// it back reads in a log like a real value.
+    #[tokio::test]
+    async fn an_empty_request_id_is_treated_as_missing_rather_than_echoed() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        let body = r#"{"requestId":"   ","records":[]}"#;
+
+        let (status, json, content_type) = call(
+            app(state),
+            post()
+                .header("X-Amz-Firehose-Request-Id", "  ")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["requestId"], MISSING_REQUEST_ID);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Response contract
+    // -------------------------------------------------------------------------------------
+
+    /// The AWS response schema says milliseconds; the legacy handler emitted seconds. A
+    /// seconds value is ~1.7e9 where a millisecond value is ~1.7e12, so magnitude alone
+    /// separates them by three orders of magnitude.
+    #[tokio::test]
+    async fn the_response_timestamp_is_in_milliseconds_not_seconds() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        let body = firehose_body(&[]);
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (status, json, _ct) = call(app(state), post().body(Body::from(body)).unwrap()).await;
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        assert_eq!(status, StatusCode::OK);
+        let timestamp = json["timestamp"].as_u64().unwrap();
+        assert!(
+            (before..=after).contains(&timestamp),
+            "expected epoch millis in {before}..={after}, got {timestamp}"
+        );
+    }
+
+    /// A body that is not JSON at all. The legacy `Json<Firehose>` extractor answered this
+    /// with plain text and no `requestId`, which Firehose reads as a 500 with no body -- the
+    /// `errorMessage` explaining the problem never reaches the S3 error records.
+    #[tokio::test]
+    async fn a_body_that_is_not_json_gets_a_conforming_400_that_keeps_the_request_id() {
+        let _log = LogTail::start();
+        let (state, mut rx) = state_with_capacity(4);
+
+        let (status, json, content_type) = call(
+            app(state),
+            post()
+                .header("X-Amz-Firehose-Request-Id", REQ_ID)
+                .body(Body::from("this is not json"))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(
+            json["requestId"], REQ_ID,
+            "the header id survives a body we cannot read"
+        );
+        assert!(rx.try_recv().is_err(), "nothing parsed, nothing enqueued");
+    }
+
+    /// `errorMessage` is capped at 8192 characters by the response schema. Overrunning it
+    /// makes the body non-conforming, which downgrades the whole response to "500 with no
+    /// body" and throws away the diagnostic -- so the cap protects the message, it does not
+    /// merely obey a rule.
+    ///
+    /// The boundary handling is the part that would otherwise bite: `String::truncate`
+    /// **panics** if the byte index is not a character boundary, and a panic inside the error
+    /// path is a dropped connection on a request that was already failing.
+    #[test]
+    fn an_overlong_error_message_is_truncated_on_a_character_boundary() {
+        let _log = LogTail::start();
+
+        // Multibyte on purpose: 9000 chars is 18000 bytes, so a naive byte truncate at 8192
+        // lands mid-codepoint.
+        let response = FirehoseResponse::error(REQ_ID.to_string(), "é".repeat(9000));
+        let message = response.error_message.expect("an error carries a message");
+        assert_eq!(
+            message.chars().count(),
+            8192,
+            "the schema caps errorMessage at 8192 characters"
+        );
+
+        // Control: a message inside the cap is passed through untouched, so the assertion
+        // above is about truncation rather than about the function mangling everything.
+        let short = FirehoseResponse::error(REQ_ID.to_string(), "buffer full");
+        assert_eq!(short.error_message.as_deref(), Some("buffer full"));
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Body limit and decompression -- the two failures that live in the layers
+    // -------------------------------------------------------------------------------------
+
+    /// axum's default limit is 2 MiB and Firehose's default buffering hint is 5 MB, so this
+    /// is the exact configuration both products ship with. Driven through `app()` rather than
+    /// `app_with_body_limit` so it is watching the constant the binary actually uses.
+    #[tokio::test]
+    async fn a_body_larger_than_axums_two_megabyte_default_is_accepted() {
+        let _log = LogTail::start();
+        let (state, mut rx) = state_with_capacity(4);
+
+        // ~3 MiB of well-formed records: past axum's default, far short of ours.
+        let line = fresh_line();
+        let mut records = Vec::new();
+        let mut total = 0usize;
+        let mut i = 0;
+        while total < 3 * 1024 * 1024 {
+            let payload = line.replace(r#""metric_name":"M""#, &format!(r#""metric_name":"M{i}""#));
+            total += payload.len();
+            records.push(payload);
+            i += 1;
+        }
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        let body = firehose_body(&refs);
+        assert!(
+            body.len() > 2 * 1024 * 1024,
+            "test setup: the body must exceed axum's default, got {}",
+            body.len()
+        );
+
+        let (status, json, content_type) =
+            call(app(state), post().body(Body::from(body)).unwrap()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(rx.try_recv().expect("enqueued").len(), records.len());
+    }
+
+    /// And the limit is genuinely at least the 64 MiB the AWS spec allows a sender to use.
+    #[test]
+    fn the_body_limit_covers_the_largest_batch_firehose_can_send() {
+        assert!(
+            MAX_BODY_BYTES >= 64 * 1024 * 1024,
+            "HttpEndpointBufferingHints.SizeInMBs may be set to 64, got {MAX_BODY_BYTES}"
+        );
+    }
+
+    /// Exceeding the limit must NOT produce 413. Driven through a deliberately tiny limit so
+    /// the assertion does not cost 64 MiB of allocation to make.
+    #[tokio::test]
+    async fn an_oversized_body_is_retryable_rather_than_destroyed() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        let body = firehose_body(&[&fresh_line()]);
+        assert!(
+            body.len() > 64,
+            "test setup: the body must exceed the limit"
+        );
+
+        let (status, json, content_type) = call(
+            app_with_body_limit(state, 64),
+            post()
+                .header("X-Amz-Firehose-Request-Id", REQ_ID)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+
+        assert_conforming(status, &json, &content_type);
+        assert_ne!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "413 makes Firehose discard the batch without writing it to the error bucket"
+        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["requestId"], REQ_ID);
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A delivery stream with compression enabled sends `Content-Encoding: gzip`. Without the
+    /// decompression layer every such request fails to deserialise -- a 400 on every single
+    /// delivery, retried until the window expires, with the whole stream ending up in S3.
+    #[tokio::test]
+    async fn a_gzip_encoded_body_is_decompressed_and_accepted() {
+        let _log = LogTail::start();
+        let (state, mut rx) = state_with_capacity(4);
+        let body = firehose_body(&[&fresh_line()]);
+        let compressed = gzip(body.as_bytes());
+        assert_ne!(
+            compressed,
+            body.as_bytes(),
+            "test setup: the body must actually be compressed"
+        );
+
+        let (status, json, content_type) = call(
+            app(state),
+            post()
+                .header("Content-Encoding", "gzip")
+                .header("X-Amz-Firehose-Request-Id", REQ_ID)
+                .body(Body::from(compressed))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(
+            rx.try_recv().expect("the decoded batch is enqueued").len(),
+            1
+        );
+    }
+
+    /// A body that gunzips cleanly but is not JSON must be diagnosed as bad JSON, not as an
+    /// undecodable encoding.
+    ///
+    /// This is the assertion behind `undecoded_content_encoding`'s premise -- that the layer
+    /// *strips* `Content-Encoding` once it has decoded, so a surviving header means it did
+    /// not. If that were wrong, every gzip-compressed request carrying one malformed record
+    /// would be answered with a confident, wrong explanation, and the `errorMessage` in the
+    /// S3 error bucket would send whoever reads it after a compression setting that is fine.
+    #[tokio::test]
+    async fn a_gzip_body_that_is_not_json_is_diagnosed_as_bad_json() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        let compressed = gzip(b"this gunzips fine but is not json");
+
+        let (status, json, content_type) = call(
+            app(state),
+            post()
+                .header("Content-Encoding", "gzip")
+                .header("X-Amz-Firehose-Request-Id", REQ_ID)
+                .body(Body::from(compressed))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_conforming(status, &json, &content_type);
+        let message = json["errorMessage"].as_str().unwrap();
+        assert!(
+            message.contains("not a Firehose JSON document"),
+            "expected a JSON diagnosis, got {message:?}"
+        );
+        assert!(
+            !message.contains("cannot"),
+            "the encoding was decoded successfully and must not be blamed, got {message:?}"
+        );
+    }
+
+    /// `Content-Encoding: identity` means "not encoded" and is a legal header value, so a
+    /// malformed body carrying one must be diagnosed as malformed rather than blamed on an
+    /// encoding that is by definition a no-op.
+    ///
+    /// Added because mutating the `identity` filter out of `undecoded_content_encoding`
+    /// survived the suite: the header is stripped after a real decode, so nothing else in
+    /// these tests ever reaches that branch with a *surviving* header naming an encoding we
+    /// did in fact understand.
+    #[tokio::test]
+    async fn an_identity_content_encoding_is_not_blamed_for_a_bad_body() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+
+        let (status, json, content_type) = call(
+            app(state),
+            post()
+                .header("Content-Encoding", "identity")
+                .header("X-Amz-Firehose-Request-Id", REQ_ID)
+                .body(Body::from("this is not json"))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_conforming(status, &json, &content_type);
+        let message = json["errorMessage"].as_str().unwrap();
+        assert!(
+            message.contains("not a Firehose JSON document"),
+            "expected a JSON diagnosis, got {message:?}"
+        );
+        assert!(
+            !message.contains("identity"),
+            "identity is not an encoding we failed to decode, got {message:?}"
+        );
+    }
+
+    /// The limit binds the **decompressed** body, not the wire bytes.
+    ///
+    /// Asserted rather than assumed, because the layer ordering could plausibly give either
+    /// answer and the two differ by orders of magnitude on exactly the input that matters:
+    /// repeated JSON gzips to a few percent of its size, so a limit applied to the compressed
+    /// bytes would admit a payload that expands past it and then buffer the whole expansion.
+    #[tokio::test]
+    async fn the_body_limit_is_measured_after_decompression() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+
+        let body = firehose_body(&[&fresh_line().repeat(400)]);
+        let compressed = gzip(body.as_bytes());
+        // Comfortably above the compressed size, far below the decompressed size.
+        let limit = compressed.len() * 2;
+        assert!(
+            body.len() > limit,
+            "test setup: decompressed {} must exceed the limit {limit}",
+            body.len()
+        );
+
+        let (status, json, content_type) = call(
+            app_with_body_limit(state, limit),
+            post()
+                .header("Content-Encoding", "gzip")
+                .header("X-Amz-Firehose-Request-Id", REQ_ID)
+                .body(Body::from(compressed))
+                .unwrap(),
+        )
+        .await;
+
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a body that expands past the limit must be cut off, not buffered whole"
+        );
+    }
+
+    /// An encoding the layer cannot handle still gets a conforming body naming the encoding,
+    /// rather than the layer's own plain-text 415 with no `requestId`.
+    #[tokio::test]
+    async fn an_undecodable_content_encoding_is_reported_by_name() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        // Deliberately not JSON: an encoding we cannot decode leaves us holding bytes that
+        // are not the document the sender meant to send, and the point of the test is which
+        // of the two possible explanations the response gives.
+        let body: Vec<u8> = vec![0x1b, 0xff, 0x00, 0x42];
+
+        let (status, json, content_type) = call(
+            app(state),
+            post()
+                .header("Content-Encoding", "br")
+                .header("X-Amz-Firehose-Request-Id", REQ_ID)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(json["requestId"], REQ_ID);
+        assert!(
+            json["errorMessage"].as_str().unwrap().contains("br"),
+            "the message must name the encoding, got {json}"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Backpressure
+    // -------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_full_channel_is_rejected_with_503_and_a_conforming_body() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(1);
+        // Fill the single slot so the handler's `try_send` cannot succeed.
+        state.tx.try_send(vec![]).expect("the first slot is free");
+        let before = REJECTED_PAYLOADS.get();
+
+        let body = firehose_body(&[&fresh_line()]);
+        let (status, json, content_type) = call(
+            app(state),
+            post()
+                .header("X-Amz-Firehose-Request-Id", REQ_ID)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(json["requestId"], REQ_ID);
+        assert_eq!(
+            REJECTED_PAYLOADS.get(),
+            before + 1.0,
+            "a rejected payload must be counted"
+        );
+    }
+
+    /// A batch that yields no series must not consume a channel slot: an empty send would
+    /// burn buffer capacity on nothing and make the writer flush an empty request.
+    #[tokio::test]
+    async fn a_batch_with_no_usable_records_is_accepted_without_enqueueing_anything() {
+        let _log = LogTail::start();
+        let (state, mut rx) = state_with_capacity(4);
+        let body = firehose_body(&["{not json}\n"]);
+
+        let (status, json, content_type) = call(
+            app(state),
+            post()
+                .header("X-Amz-Firehose-Request-Id", REQ_ID)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_conforming(status, &json, &content_type);
+        assert!(rx.try_recv().is_err(), "nothing usable, nothing enqueued");
+    }
+
+    /// One bad record among good ones costs that record and nothing else.
+    #[tokio::test]
+    async fn a_malformed_record_is_skipped_and_the_rest_of_the_batch_is_delivered() {
+        let _log = LogTail::start();
+        let (state, mut rx) = state_with_capacity(4);
+        let before = RECORDS_SKIPPED.get();
+
+        // Hand-built so one record's `data` is not valid base64 at all.
+        let good = BASE64_STANDARD.encode(fresh_line());
+        let body = format!(
+            r#"{{"requestId":"{REQ_ID}","records":[{{"data":"!!!"}},{{"data":"{good}"}}]}}"#
+        );
+
+        let (status, json, content_type) =
+            call(app(state), post().body(Body::from(body)).unwrap()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_conforming(status, &json, &content_type);
+        assert_eq!(rx.try_recv().expect("the good record survives").len(), 1);
+        assert_eq!(RECORDS_SKIPPED.get(), before + 1.0);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Source ARN discovery
+    // -------------------------------------------------------------------------------------
+
+    const ARN: &str = "arn:aws:firehose:us-east-1:123456789:deliverystream/testStream";
+
+    #[tokio::test]
+    async fn the_source_arn_is_recorded_from_the_header_and_from_the_body() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        let body = firehose_body(&[]);
+
+        call(
+            app(state.clone()),
+            post()
+                .header("X-Amz-Firehose-Source-Arn", ARN)
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert!(state.firehose_arns.read().await.contains(ARN));
+
+        let with_body_arn =
+            format!(r#"{{"requestId":"{REQ_ID}","source_arn":"other-arn","records":[]}}"#);
+        call(
+            app(state.clone()),
+            post().body(Body::from(with_body_arn)).unwrap(),
+        )
+        .await;
+        assert!(state.firehose_arns.read().await.contains("other-arn"));
+    }
+
+    /// The write lock is taken only on a miss. Held read guard + known ARN must not block:
+    /// `tokio::sync::RwLock` queues writers behind live readers, so a handler that took
+    /// `write()` unconditionally would hang here rather than return.
+    #[tokio::test]
+    async fn a_known_arn_does_not_take_the_write_lock() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        state.firehose_arns.write().await.insert(ARN.to_string());
+
+        let guard = state.firehose_arns.read().await;
+        let body = firehose_body(&[]);
+        let request = post()
+            .header("X-Amz-Firehose-Source-Arn", ARN)
+            .body(Body::from(body))
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), app(state.clone()).oneshot(request)).await;
+
+        drop(guard);
+        assert!(
+            result.is_ok(),
+            "the handler must not wait for the write lock when the ARN is already known"
+        );
+        assert_eq!(result.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    /// CONTROL for the test above: with an ARN that is *not* known, the same held read guard
+    /// does block the handler. Without this, `a_known_arn_does_not_take_the_write_lock` would
+    /// pass just as happily against an implementation that never locked at all, or against a
+    /// `RwLock` whose writers do not queue behind readers.
+    #[tokio::test]
+    async fn an_unknown_arn_does_take_the_write_lock() {
+        let _log = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+
+        let guard = state.firehose_arns.read().await;
+        let body = firehose_body(&[]);
+        let request = post()
+            .header("X-Amz-Firehose-Source-Arn", "an-arn-nobody-has-seen")
+            .body(Body::from(body))
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            app(state.clone()).oneshot(request),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "control: a new ARN must block on the write lock, or the sibling test proves \
+             nothing about the read-first path"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_source_arn_anywhere_is_still_accepted() {
+        let tail = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        let body = firehose_body(&[]);
+
+        let (status, json, content_type) =
+            call(app(state.clone()), post().body(Body::from(body)).unwrap()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_conforming(status, &json, &content_type);
+        assert!(state.firehose_arns.read().await.is_empty());
+        assert!(
+            tail.tail().contains("no source arn"),
+            "the absence must be visible in the log"
+        );
     }
 }

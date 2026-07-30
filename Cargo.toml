@@ -29,6 +29,12 @@ aws-arn = "0.3.1"
 aws-config = "1.8.11"
 cached = { version = "0.56.0", features = ["async_tokio_rt_multi_thread"] }
 aws-smithy-types = "1.3.4"
+# Two features, each closing a way this endpoint silently loses data -- see the notes on
+# `MAX_BODY_BYTES` and `app_with_body_limit` in `main.rs`. `decompression-gzip` decodes the
+# bodies a delivery stream with compression enabled sends; `map-request-body` is what lets
+# the decompression layer's output typecheck against axum's `Route`. 0.5 is the line that
+# pairs with axum 0.7 (both on http 1.x).
+tower-http = { version = "0.5", features = ["decompression-gzip", "map-request-body"] }
 
 [dev-dependencies]
 # `test-util` gives the retry tests `#[tokio::test(start_paused = true)]`: a virtual clock the
@@ -47,3 +53,11 @@ http = "1.1"
 # resolves to in Cargo.lock, so this pulls nothing new into the build.
 prost = "0.12"
 snap = "1.1"
+# `ServiceExt::oneshot`, so the handler tests drive the real `Router` -- layers included --
+# rather than calling `get_firehose` directly. That distinction is load-bearing: the body
+# limit and the gzip decoding live in the layers, so a test that called the function would
+# pass with both deleted. 0.4 matches the tower axum 0.7 itself depends on.
+tower = { version = "0.4", features = ["util"] }
+# Builds the gzip bodies for the decompression tests. Already in the tree via tower-http's
+# async-compression, so this pulls nothing new into the build.
+flate2 = "1.1.9"
