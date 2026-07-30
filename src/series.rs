@@ -166,6 +166,16 @@ pub fn labels_for(metric: &CloudWatchMetric, full_metric_name: &str) -> Vec<Labe
     ];
 
     for dim in metric.dimensions.to_labels_values() {
+        // An empty label value is *equivalent to an absent label* in the Prometheus data
+        // model — `foo=""` and no `foo` at all select and store identically. Emitting it
+        // therefore costs wire bytes for zero semantic content, and rollup records (the
+        // common case) are exactly the ones carrying empty dimensions. Dropping here yields
+        // byte-identical stored series, so this is not data loss and must not be "restored"
+        // by someone later reading it as such.
+        if dim.value.is_empty() {
+            continue;
+        }
+
         let Some(name) = label_name_for_dimension(&dim.key) else {
             warn!("dropping dimension with unusable name {:?}", dim.key);
             continue;
@@ -183,9 +193,29 @@ pub fn labels_for(metric: &CloudWatchMetric, full_metric_name: &str) -> Vec<Labe
     // A duplicate label name gets the ENTIRE write request rejected by the receiver,
     // killing every good sample batched alongside it. Distinct dimensions can normalize
     // onto one name (`InstanceId`, `instance_id` and `Instance-Id` all become
-    // `instance_id`), so this is reachable from real input, and because the source is a
-    // HashMap, which one survives is nondeterministic across runs.
-    labels.dedup_by(|a, b| a.name == b.name);
+    // `instance_id`), so this is reachable from real input.
+    //
+    // Which value survives is genuinely nondeterministic and cannot be made otherwise here.
+    // `sort_by` is stable, so ties keep insertion order — but insertion order for dimensions
+    // is `HashMap` iteration order. (Our own four labels are always inserted first and so
+    // always win a tie, but `RESERVED_LABELS` already prefixes any dimension that could
+    // collide with them, so no such tie is reachable; every reachable collision is
+    // dimension-vs-dimension.) The same record can therefore produce a different series on
+    // two runs, which is precisely why discarding silently is unacceptable: log it so a
+    // missing dimension leaves a thread to pull.
+    //
+    // `dedup_by` passes elements in reverse slice order — returning true removes `a` and
+    // keeps `b` — so `b` is the earlier element and the survivor.
+    labels.dedup_by(|a, b| {
+        if a.name == b.name {
+            warn!(
+                "dropping duplicate label {:?}: kept value {:?}, discarded {:?}",
+                a.name, b.value, a.value
+            );
+            return true;
+        }
+        false
+    });
 
     labels
 }
@@ -193,6 +223,7 @@ pub fn labels_for(metric: &CloudWatchMetric, full_metric_name: &str) -> Vec<Labe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     fn metric_from(json: &str) -> CloudWatchMetric {
         serde_json::from_str(json).expect("fixture should deserialize")
@@ -315,6 +346,67 @@ mod tests {
                  "metric_name":"RequestCount","dimensions":{dims},
                  "timestamp":1700000000000,"value":{{"max":1.0}},"unit":"Count"}}"#
         ))
+    }
+
+    /// Capture `tracing` output so tests can assert on log lines.
+    ///
+    /// A dropped label that is never logged is invisible in production, so "does it warn" is
+    /// a real behaviour and needs a real assertion — without this, deleting the `warn!` kills
+    /// no test and the guard rots.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Install a process-wide log sink exactly once, and hand back its buffer.
+    ///
+    /// This is deliberately *global* rather than `tracing::subscriber::with_default`, and the
+    /// distinction is load-bearing. `tracing` caches per callsite whether anyone is listening.
+    /// `with_default` only redirects the calling thread, so a test running concurrently on
+    /// another thread sees no subscriber, hits the `warn!` in `labels_for`, and re-caches that
+    /// callsite as "nobody is listening" — silently emptying the buffer of whichever test was
+    /// asserting on it. Measured, not theorised: with `with_default` this suite failed 2 runs
+    /// in 30, and adding `rebuild_interest_cache` only narrowed the window rather than closing
+    /// it, because the race is against other threads re-caching afterwards.
+    ///
+    /// A global default is installed for every thread and never removed, so once
+    /// `set_global_default` rebuilds the interest cache the callsite stays enabled for good.
+    /// `main()` installs its own subscriber but is never called under test, so there is no
+    /// conflict over the single global slot.
+    fn log_sink() -> &'static Arc<Mutex<Vec<u8>>> {
+        static LOG_SINK: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+        LOG_SINK.get_or_init(|| {
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(CaptureWriter(buffer.clone()))
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("test binary installs exactly one global subscriber");
+            buffer
+        })
+    }
+
+    /// Everything logged so far, by any test. Assertions must therefore key off values unique
+    /// to the calling test rather than assuming the buffer holds only their own output.
+    fn captured_logs() -> String {
+        let bytes = log_sink().lock().unwrap().clone();
+        String::from_utf8(bytes).expect("log output should be utf-8")
     }
 
     fn label_pairs(labels: &[Label]) -> Vec<(String, String)> {
@@ -521,6 +613,75 @@ mod tests {
             before,
             "duplicate label names would 400 the batch"
         );
+
+        // Deliberately NOT asserting *which* value survives. Ties keep insertion order and
+        // insertion order here is `HashMap` iteration order, so the survivor genuinely varies
+        // between runs; pinning one would flake. Assert only what is actually guaranteed.
+        let survivor = labels.iter().find(|l| l.name == "instance_id").unwrap();
+        assert!(
+            ["a", "b", "c"].contains(&survivor.value.as_str()),
+            "survivor should be one of the colliding dimensions, got {:?}",
+            survivor.value
+        );
+    }
+
+    /// The collision above discards a value. Silent, nondeterministic data loss is the worst
+    /// combination available — the same input yields different series run to run and nothing
+    /// says so — so the discard must leave a diagnosable trace.
+    #[test]
+    fn discarded_duplicate_labels_are_logged_with_both_values() {
+        // Install the sink *before* emitting, so the callsite is enabled when we hit it.
+        log_sink();
+        // Values are unique to this test: the buffer is shared with every other test, and
+        // `label_names_are_unique_after_normalization` collides on the same label name.
+        labels_for(
+            &with_dims(r#"{"InstanceId":"dup-aa","instance_id":"dup-bb","Instance-Id":"dup-cc"}"#),
+            "m",
+        );
+        let logs = captured_logs();
+
+        assert!(
+            logs.contains("dropping duplicate label"),
+            "a discarded label must be diagnosable from the logs, got: {logs}"
+        );
+        assert!(
+            logs.contains("instance_id"),
+            "the log must name the colliding label, got: {logs}"
+        );
+        // Two of the three values are discarded and one is kept; whichever way the HashMap
+        // ordered them, all three must appear across the log lines for an operator to
+        // reconstruct the collision.
+        for v in ["dup-aa", "dup-bb", "dup-cc"] {
+            assert!(
+                logs.contains(&format!("{v:?}")),
+                "value {v:?} missing from logs, got: {logs}"
+            );
+        }
+    }
+
+    /// `foo=""` and an absent `foo` are indistinguishable once stored, so sending the empty
+    /// one is pure wire overhead — and rollup records, the common case, are the ones that
+    /// carry empty dimensions.
+    #[test]
+    fn dimensions_with_empty_values_are_dropped() {
+        let labels = labels_for(
+            &with_dims(r#"{"LoadBalancer":"","TargetGroup":"tg/bar"}"#),
+            "m",
+        );
+        assert!(
+            !labels.iter().any(|l| l.name == "load_balancer"),
+            "empty-valued dimension should not be emitted, got {:?}",
+            label_pairs(&labels)
+        );
+        assert!(
+            labels.iter().all(|l| !l.value.is_empty()),
+            "no label should carry an empty value, got {:?}",
+            label_pairs(&labels)
+        );
+        // The non-empty sibling is untouched.
+        assert!(labels
+            .iter()
+            .any(|l| l.name == "target_group" && l.value == "tg/bar"));
     }
 
     #[test]
