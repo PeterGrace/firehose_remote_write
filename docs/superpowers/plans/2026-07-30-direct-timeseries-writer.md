@@ -1923,6 +1923,37 @@ Update the freshness task to use `state.firehose_arns.read().await.clone()`.
 
 Remove the unreachable `loop {}` after `axum::serve(...).await.unwrap();`.
 
+- [ ] **Step 1a: Graceful shutdown, or the writer's drain path is dead code**
+
+`run_writer` exits on channel close, which requires every `Sender` to drop. Today
+`axum::serve(listener, app).await` has no `.with_graceful_shutdown()`, so on SIGTERM the
+process dies with the `Sender` still held in `AppState`. The shutdown drain — and its
+`warn!` — would never run in production, and its tests would be exercising a path that
+exists only in tests.
+
+Wire it: `axum::serve(...).with_graceful_shutdown(shutdown_signal())` listening for
+SIGTERM and Ctrl-C, then **drop the sender** (or the whole `AppState`), then `await` the
+writer's `JoinHandle` so the final flush completes before the process exits. Keep the
+`JoinHandle` from `tokio::spawn(run_writer(...))` rather than discarding it.
+
+Order matters and is easy to get wrong: serve → shutdown signal → drop sender → await
+writer. Dropping the sender before the server stops would make in-flight handlers fail.
+
+- [ ] **Step 1c: Give the reqwest client timeouts**
+
+`Client::new()` has no request timeout — reqwest sets none by default. Combined with the
+writer being the only task draining the channel, a blackholed connection to the
+remote-write endpoint stalls ingestion permanently. `push_with_retry` now has a
+per-attempt timeout as defence in depth, but the client should carry its own:
+
+```rust
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .expect("failed to build HTTP client");
+```
+
 - [ ] **Step 1b: Populate `APP_INFO`, and fix its double prefix**
 
 `APP_INFO` is registered but never set outside a test, so it has never appeared in
