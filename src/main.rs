@@ -16,7 +16,8 @@ extern crate anyhow;
 use crate::aws::get_freshness;
 use crate::config::Config;
 use crate::prometheus::{
-    FRESHNESS_INFO, RECORDS_SKIPPED, REJECTED_PAYLOADS, STREAMS_RECEIVED, TOTAL_WRITES_SENT,
+    APP_INFO, FRESHNESS_INFO, RECORDS_SKIPPED, REJECTED_PAYLOADS, STREAMS_RECEIVED,
+    TOTAL_WRITES_SENT,
 };
 use crate::series::to_series;
 use crate::structs::{AppState, FirehoseData, FirehoseResponse};
@@ -31,8 +32,11 @@ use axum::{debug_handler, Json, Router};
 use base64::prelude::*;
 use prometheus_remote_write::{Label, Sample};
 use std::env;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::map_request_body::MapRequestBodyLayer;
@@ -76,6 +80,142 @@ const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// from anything else that POSTs here, which is why it must not panic.
 const MISSING_REQUEST_ID: &str = "missing-request-id";
 
+/// How long one whole remote-write request may take before reqwest abandons it.
+///
+/// Chosen *above* [`writer::PER_ATTEMPT_TIMEOUT`] (10s) so that the retry policy's own bound
+/// is the one that normally fires: the policy counts a timed-out attempt as a failed attempt
+/// and retries it, whereas a reqwest timeout surfaces as an error the policy then has to
+/// interpret. Being the outer of the two also means this cannot cut short a request the
+/// policy considers healthy.
+///
+/// # As wired today this can never fire, and that is deliberate rather than an oversight
+///
+/// `push_with_retry` wraps every `send` in `tokio::time::timeout(PER_ATTEMPT_TIMEOUT, ..)`,
+/// which at 10s always wins against 15s -- and dropping that future cancels the reqwest
+/// request outright. So neither of these two settings is observable in the current call
+/// graph. They are kept because the thing they guard against is the closure below being
+/// reused, or `PER_ATTEMPT_TIMEOUT` being raised, by somebody who does not know that
+/// `reqwest::Client::new()` has **no default request timeout at all** -- and the cost of that
+/// mistake is the single task draining the channel hanging forever on a blackholed socket.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long the TCP connect and TLS handshake may take. Subsumed by
+/// [`HTTP_REQUEST_TIMEOUT`], and kept for the same reason.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Publish which build is running, as a label set on a gauge that is always 1.
+///
+/// Takes its two values as parameters rather than reading `env!` itself so that the trimming
+/// below is reachable from a test. That is not ceremony: without the seam, the only input
+/// this function can ever see is whatever `GIT_HASH` happens to hold in the tree it was
+/// compiled in, so deleting the `trim()` would kill nothing.
+///
+/// # `GIT_HASH` does NOT carry a trailing newline, contrary to how `build.rs` reads
+///
+/// `build.rs` does `String::from_utf8(git rev-parse HEAD)` without trimming, so the string it
+/// interpolates genuinely ends in `\n`. It never reaches the binary: cargo parses build
+/// script stdout **line by line**, so `cargo:rustc-env=GIT_HASH=<sha>\n` sets the variable to
+/// the line's contents and the newline becomes the line terminator. Measured, not reasoned:
+/// a scratch crate with the identical `build.rs` reports `len=40`.
+///
+/// The `trim()` therefore does nothing today. It stays because it makes this function total
+/// over its input -- a label value with whitespace in it is a different series from the same
+/// value without, so a future `build.rs` that emitted the hash by another route (a file, a
+/// multi-line directive) would otherwise split `app_info` in two -- and
+/// `app_info_labels_are_trimmed` is what keeps it honest.
+fn set_app_info(crate_version: &str, git_hash: &str) {
+    APP_INFO
+        .with_label_values(&[crate_version.trim(), git_hash.trim()])
+        .set(1.0);
+}
+
+/// Resolve when the process is asked to stop, by either of the two routes that can ask.
+///
+/// SIGTERM is what Kubernetes sends first, and it is the one that matters: the container gets
+/// `terminationGracePeriodSeconds` to finish before SIGKILL, and everything still sitting in
+/// the channel or the accumulator at SIGKILL is gone with nothing upstream to replay it (see
+/// the durability note on [`writer::run_writer`]). Ctrl-C is for running this by hand.
+///
+/// Both handlers are installed *before* either is awaited, so there is no window in which one
+/// signal is armed and the other is not.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install the Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install the SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received Ctrl-C; draining before exit"),
+        _ = terminate => info!("received SIGTERM; draining before exit"),
+    }
+}
+
+/// Serve until `shutdown` resolves, then let the writer finish.
+///
+/// # The order of the four steps below is the whole point of this function
+///
+/// `run_writer` reaches its final-flush arm when `rx.recv()` returns `None`, and that happens
+/// only once **every** `Sender` has dropped. So:
+///
+/// 1. **Serve first.** The router holds a `Sender` and clones it into every in-flight handler.
+///    Releasing it before the server has stopped would make `try_send` fail in handlers that
+///    are mid-request, turning a clean shutdown into a burst of 503s on deliveries that were
+///    already accepted onto the socket.
+/// 2. **Then release the router.** `app` is moved into the `Serve` future, and the temporary
+///    holding it is dropped at the end of the `let served = ...;` statement — before anything
+///    below runs. This is load-bearing and easy to lose: binding the future to a variable that
+///    outlives the `drop(state)` below, or keeping a second `Router` clone anywhere, leaves a
+///    `Sender` alive and step 4 waits for it forever.
+/// 3. **Then drop `state`,** which is the last `Sender` outside the router. Now the channel is
+///    closed and the writer's drain arm becomes reachable.
+/// 4. **Then wait for the writer,** because the drain arm still has to *run*: it flushes the
+///    accumulator and pushes it, with retries. Returning from `main` without this await drops
+///    the runtime and takes the task with it mid-flush.
+///
+/// The `firehose_arns` freshness task is deliberately not given an `AppState` — see the
+/// comment at its spawn site. A single parked clone anywhere in the process defeats all four
+/// steps above, and does so silently: the process still exits, it just exits by being killed
+/// rather than by finishing.
+///
+/// Generic over the shutdown future so `shutdown_flushes_data_that_is_still_buffered` can
+/// drive the real ordering from a test without raising a real signal.
+async fn serve_and_drain(
+    listener: TcpListener,
+    app: Router,
+    state: AppState,
+    writer: JoinHandle<()>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await;
+    if let Err(e) = served {
+        error!("the http listener stopped with an error: {e}");
+    }
+
+    // Step 3. Explicit rather than end-of-scope, because "the last sender is released here,
+    // before the await below" is the property, and a later edit that added a use of `state`
+    // after this point would silently extend its life past the await.
+    drop(state);
+
+    // Step 4. A panic in the writer is reported rather than propagated: we are on the way out
+    // either way, and an unwrap here would replace a legible error with a second panic.
+    if let Err(e) = writer.await {
+        error!("the writer task did not exit cleanly: {e}");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let filter_layer = EnvFilter::try_from_default_env()
@@ -87,14 +227,22 @@ async fn main() {
         .with_line_number(true)
         .init();
 
+    set_app_info(env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
+
     let config = Config::from_env();
     let addr = env::var("PROM_WRITE_ADDR").expect("Can't push without PROM_WRITE_ADDR defined");
     let url = format!("{addr}/api/v1/write");
     let (tx, rx) = tokio::sync::mpsc::channel(config.channel_capacity);
     let state = AppState::new(tx);
 
-    let client = reqwest::Client::new();
-    tokio::spawn(run_writer(rx, config.clone(), move |body| {
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .build()
+        .expect("failed to build the remote-write HTTP client");
+    // The `JoinHandle` is kept, not discarded: `serve_and_drain` awaits it so the final flush
+    // finishes before the runtime is torn down.
+    let writer = tokio::spawn(run_writer(rx, config, move |body| {
         let client = client.clone();
         let url = url.clone();
         async move {
@@ -118,10 +266,10 @@ async fn main() {
     // `AppState` owns a `Sender`, and `run_writer` only reaches its shutdown-drain arm once
     // *every* `Sender` has dropped. This task loops forever, so a clone of `AppState` parked
     // inside it would keep one alive for the life of the process -- making the drain
-    // unreachable and quietly discarding the buffer's tail on every shutdown. Task 11 wires
-    // the graceful shutdown that depends on this.
+    // unreachable and quietly discarding the buffer's tail on every shutdown. See
+    // [`serve_and_drain`], which is what depends on this.
     let firehose_arns = Arc::clone(&state.firehose_arns);
-    let app = app(state);
+    let app = app(state.clone());
 
     tokio::spawn(async move {
         let mut interval = interval(Duration::from_secs(60));
@@ -140,9 +288,10 @@ async fn main() {
         }
     });
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
     info!("Spawning axum listener.");
-    axum::serve(listener, app).await.unwrap();
+    serve_and_drain(listener, app, state, writer, shutdown_signal()).await;
+    info!("Drained; exiting.");
 }
 
 /// The real router, layers and all.
@@ -1371,6 +1520,266 @@ mod tests {
              nothing about the read-first path"
         );
         drop(guard);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Build identity
+    // -------------------------------------------------------------------------------------
+
+    /// The `trim()` in [`set_app_info`], driven with input that actually needs trimming.
+    ///
+    /// This exists because the real input does *not* need it -- see the doc comment on
+    /// `set_app_info` -- so without a seam and a hand-made value, deleting the `trim()` kills
+    /// nothing and the guard rots. The failure it guards against is not cosmetic: a label
+    /// value differing by a newline is a different series, so `app_info` would silently
+    /// become two series describing one build.
+    #[test]
+    fn app_info_labels_are_trimmed() {
+        let _log = LogTail::start();
+        set_app_info("9.9.9-trimtest\n", "  0badc0de\n");
+
+        let families = ::prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.get_name() == "firehose_app_info")
+            .expect("app_info must be registered under exactly one firehose_ prefix");
+        let found = family.get_metric().iter().any(|m| {
+            let labels: std::collections::BTreeMap<&str, &str> = m
+                .get_label()
+                .iter()
+                .map(|l| (l.get_name(), l.get_value()))
+                .collect();
+            labels.get("crate_version") == Some(&"9.9.9-trimtest")
+                && labels.get("git_hash") == Some(&"0badc0de")
+        });
+        assert!(
+            found,
+            "the label values must be trimmed, got: {:?}",
+            family.get_metric()
+        );
+    }
+
+    /// What `set_app_info` is actually handed in the binary, asserted against the build.
+    ///
+    /// `GIT_HASH` is produced by `build.rs` shelling out to `git rev-parse HEAD`, and the
+    /// value that ends up in the binary is *not* what `build.rs` interpolates -- cargo splits
+    /// build-script stdout into lines, so the trailing newline never survives. Pinned here
+    /// rather than assumed, because the assumption cuts both ways: a `git_hash` label with a
+    /// newline in it would split the series, and one that was empty (a build with no git
+    /// available) would leave the metric unable to answer the one question it exists for.
+    #[test]
+    fn the_git_hash_baked_into_the_binary_is_a_bare_commit_id() {
+        let raw = env!("GIT_HASH");
+        assert_eq!(
+            raw,
+            raw.trim(),
+            "cargo strips the newline build.rs emits; got {raw:?}"
+        );
+        assert_eq!(raw.len(), 40, "a full sha-1 commit id, got {raw:?}");
+        assert!(raw.chars().all(|c| c.is_ascii_hexdigit()), "got {raw:?}");
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Graceful shutdown
+    // -------------------------------------------------------------------------------------
+
+    /// Decode the bytes the writer actually pushed, so the assertion is about the wire and
+    /// not about a `WriteRequest` that was built and then never encoded.
+    fn decode_write_request(body: &[u8]) -> prometheus_remote_write::WriteRequest {
+        let raw = snap::raw::Decoder::new()
+            .decompress_vec(body)
+            .expect("body must be snappy-compressed");
+        prost::Message::decode(raw.as_slice()).expect("body must decode as a WriteRequest")
+    }
+
+    fn metric_names(request: &prometheus_remote_write::WriteRequest) -> Vec<&str> {
+        request
+            .timeseries
+            .iter()
+            .filter_map(|s| {
+                s.labels
+                    .iter()
+                    .find(|l| l.name == "__name__")
+                    .map(|l| l.value.as_str())
+            })
+            .collect()
+    }
+
+    /// **The shutdown drain, end to end, over a real socket.**
+    ///
+    /// This is the test the whole graceful-shutdown wiring exists for, and it is written to
+    /// fail rather than hang in every way the wiring can be got wrong:
+    ///
+    /// * **No `drop(state)`** -- the channel never closes, `run_writer` never returns, the
+    ///   `writer.await` inside `serve_and_drain` blocks forever and the timeout below fires.
+    ///   (Measured: this is exactly what happens.)
+    /// * **A `Router` clone kept alive past the drop** -- same symptom, same detector.
+    /// * **No `writer.await`** -- `serve_and_drain` returns while the final flush is still in
+    ///   flight, which the gate below turns into a deterministic failure.
+    /// * **Serving after the sender is released** -- the request would be answered 503.
+    ///
+    /// # The gate is what makes the `writer.await` assertion real
+    ///
+    /// The first version of this test simply asserted that the body had arrived once
+    /// `serve_and_drain` returned. **That mutant survived**: dropping the `JoinHandle` instead
+    /// of awaiting it detaches the writer rather than killing it, and on a current-thread
+    /// runtime the detached task usually got polled during the `timeout` await anyway, so the
+    /// push landed before the assertion looked. A pass that depends on the scheduler is not a
+    /// detector.
+    ///
+    /// So the push is held open by a semaphore the test controls. A correct `serve_and_drain`
+    /// is then *inside* `writer.await`, inside the flush, blocked -- and `is_finished()` must
+    /// be false. Only an implementation that failed to wait can have returned. The healthy
+    /// direction of that assertion needs no timing luck: while the gate is shut, a correct
+    /// implementation cannot finish however long it is given.
+    ///
+    /// The control at the top matters as much. `FLUSH_INTERVAL_SECS` is an hour and the series
+    /// threshold is out of reach, so the only arm of `run_writer` that can push here is the
+    /// channel-closed one; `assert!(try_recv().is_err())` before the signal proves that,
+    /// rather than leaving the final assertion satisfiable by an ordinary timed flush.
+    #[tokio::test]
+    async fn shutdown_flushes_data_that_is_still_buffered() {
+        let _log = LogTail::start();
+
+        let config =
+            crate::config::Config::from_values(Some("3600"), Some("100000"), None, Some("1"));
+        let (tx, rx) = channel(16);
+        let state = AppState::new(tx);
+
+        // Zero permits: the writer's push blocks here until the test opens it.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let writer_gate = Arc::clone(&gate);
+        let (pushed_tx, mut pushed_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let writer = tokio::spawn(run_writer(rx, config, move |body| {
+            let pushed_tx = pushed_tx.clone();
+            let gate = Arc::clone(&writer_gate);
+            async move {
+                let _permit = gate
+                    .acquire_owned()
+                    .await
+                    .expect("the gate is never closed");
+                let _ = pushed_tx.send(body);
+                Ok(200u16)
+            }
+        }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_and_drain(
+            listener,
+            app(state.clone()),
+            state,
+            writer,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        // A real HTTP delivery, so the `Sender` the drain waits on is the one axum cloned
+        // into a handler -- not one this test conveniently kept a reference to.
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/"))
+            .header("X-Amz-Firehose-Request-Id", REQ_ID)
+            .body(firehose_body(&[&fresh_line()]))
+            .send()
+            .await
+            .expect("the server must accept the delivery");
+        assert_eq!(response.status().as_u16(), 200, "the delivery was accepted");
+        // Release the pooled keep-alive connection before signalling: an idle connection is
+        // one `with_graceful_shutdown` has to wait out, and this test would then be measuring
+        // reqwest's pool rather than the drain.
+        drop(response);
+        drop(client);
+
+        assert!(
+            pushed_rx.try_recv().is_err(),
+            "CONTROL: the flush interval is an hour away and the threshold is out of reach, \
+             so nothing may have been pushed yet"
+        );
+
+        shutdown_tx.send(()).expect("the server is still running");
+
+        // With the gate shut, a correct `serve_and_drain` is parked inside the writer's final
+        // flush and cannot have returned. This is the assertion that catches a dropped
+        // `JoinHandle` -- see the note above on why the obvious version of it does not.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !server.is_finished(),
+            "serve_and_drain returned while the final flush was still in flight; the writer's \
+             JoinHandle must be awaited, not dropped"
+        );
+        assert!(
+            pushed_rx.try_recv().is_err(),
+            "CONTROL: the gate is shut, so nothing can have been pushed through it yet"
+        );
+
+        gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("serve_and_drain must return; a sender that outlives it hangs here")
+            .expect("serve_and_drain must not panic");
+
+        let body = pushed_rx
+            .try_recv()
+            .expect("the buffered batch must reach the wire before the process exits");
+        let request = decode_write_request(&body);
+        let names = metric_names(&request);
+        assert!(
+            names.contains(&"firehose_test_m_count_max"),
+            "the drained payload must carry the record that was accepted, got {names:?}"
+        );
+        assert!(
+            pushed_rx.try_recv().is_err(),
+            "one flush, not a loop of them"
+        );
+    }
+
+    /// The other half: with nothing buffered, the same path still terminates promptly rather
+    /// than waiting for an interval tick that is an hour away. Without this,
+    /// `shutdown_flushes_data_that_is_still_buffered` would pass against an implementation
+    /// that only ever exits because a flush happened to be due.
+    #[tokio::test]
+    async fn shutdown_returns_promptly_with_an_empty_buffer() {
+        let _log = LogTail::start();
+
+        let config =
+            crate::config::Config::from_values(Some("3600"), Some("100000"), None, Some("1"));
+        let (tx, rx) = channel(16);
+        let state = AppState::new(tx);
+
+        let (pushed_tx, mut pushed_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let writer = tokio::spawn(run_writer(rx, config, move |body| {
+            let pushed_tx = pushed_tx.clone();
+            async move {
+                let _ = pushed_tx.send(body);
+                Ok(200u16)
+            }
+        }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_and_drain(
+            listener,
+            app(state.clone()),
+            state,
+            writer,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        shutdown_tx.send(()).expect("the server is still running");
+        tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("an idle server must still return after the shutdown signal")
+            .expect("serve_and_drain must not panic");
+
+        assert!(
+            pushed_rx.try_recv().is_err(),
+            "an empty accumulator must not push an empty write request"
+        );
     }
 
     #[tokio::test]

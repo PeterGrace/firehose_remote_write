@@ -98,8 +98,8 @@ pub fn build_request(cloudwatch: Vec<TimeSeries>, self_metrics: Vec<TimeSeries>)
 
 /// Gather app self-metrics from the client registry and convert them to series.
 ///
-/// THIS IS THE ONLY PATH SELF-METRICS TAKE TO THE WIRE once Task 11 deletes
-/// `push_firehose_metrics`. If this is not called from the flush, every `self_*` counter
+/// THIS IS THE ONLY PATH SELF-METRICS TAKE TO THE WIRE. If this is not called from the
+/// flush, every `self_*` counter
 /// and gauge becomes write-only: incremented forever, never exported, and invisible
 /// exactly when something is going wrong.
 ///
@@ -118,7 +118,7 @@ pub fn build_request(cloudwatch: Vec<TimeSeries>, self_metrics: Vec<TimeSeries>)
 /// * **Histograms and summaries are rejected outright.** `samples_to_timeseries` returns
 ///   `Err` for both, and it fails the *whole* request, not the offending family — one
 ///   registered histogram would silently zero every self-metric on every flush. We register
-///   none today (the `HISTOGRAMS` map is never populated); if that changes, this must stop
+///   none today, and `prometheus.rs` says why not; if that changes, this must stop
 ///   going through the text format.
 /// * **`HELP`/`TYPE` lines are metadata and simply do not become samples**, which is why
 ///   a family that has never been touched contributes nothing rather than a zero.
@@ -1156,9 +1156,10 @@ mod tests {
     /// therefore silently zero *every* self-metric on *every* flush, forever, and the only
     /// evidence would be one `error!` line per flush.
     ///
-    /// We register no histograms today — the `HISTOGRAMS` map exists but nothing inserts into
-    /// it — so this pins the hazard against the parser directly rather than polluting the
-    /// process-global registry with a histogram that every other test would then inherit.
+    /// We register no histograms today, and the `lazy_static!` block in `prometheus.rs` says
+    /// at length why none may be added — so this pins the hazard against the parser directly
+    /// rather than polluting the process-global registry with a histogram that every other
+    /// test would then inherit.
     #[test]
     fn from_text_format_rejects_the_entire_payload_when_a_histogram_is_present() {
         let _log = LogTail::start();

@@ -14,7 +14,11 @@ serde_yaml = "0.9.34"
 # `time` is declared explicitly because `writer::push_with_retry` calls `tokio::time::sleep`
 # in production code. It was already reaching the build transitively via axum, which is not
 # something a crate should depend on for an API it uses directly.
-tokio = { version = "1.37.0", features=["macros","rt-multi-thread","time"] }
+# `signal` is what `main::shutdown_signal` needs. It is not optional decoration: without a
+# SIGTERM handler the process dies with the writer's `Sender` still held, so the final flush
+# never runs and the tail of the buffer is lost on every rollout -- and nothing upstream
+# replays it, because Firehose was already told 200.
+tokio = { version = "1.37.0", features=["macros","rt-multi-thread","time","signal"] }
 lazy_static = "1.4.0"
 anyhow = "1.0.86"
 url = "2.5.0"
@@ -43,9 +47,6 @@ tower-http = { version = "0.5", features = ["decompression-gzip", "map-request-b
 # on a loaded CI box -- and the schedule is the only thing watching several of these mutants.
 # Under resolver 2 a dev-dependency feature does not reach the release binary.
 tokio = { version = "1.37.0", features = ["test-util"] }
-aws-smithy-runtime = { version = "1.9.4", features = ["client", "test-util"] }
-aws-credential-types = { version = "1", features = ["test-util"] }
-http = "1.1"
 # `every_received_batch_reaches_the_payload` decodes the bytes the writer actually pushed,
 # rather than asserting on the `WriteRequest` it built. Those are different claims: the
 # encode step sits between them and is where "the body is snappy-compressed protobuf" is
