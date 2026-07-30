@@ -173,7 +173,7 @@ fn series_from_text(text: String) -> Vec<TimeSeries> {
 /// type, and the result would be a panicking writer task -- the one task draining the channel.
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
-/// The longest `push_with_retry` may stay in its retry loop, whatever the attempt count says.
+/// The budget governing how long `push_with_retry` may spend *between* attempts.
 ///
 /// The writer is a single serialization point: while it is sleeping it is not draining its
 /// channel, so the handler starts rejecting payloads and Firehose backs up behind it. The
@@ -181,7 +181,56 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// eight minutes of stall spent on one batch that is being dropped anyway, and every batch
 /// behind it pays for the attempt. Trading one lost batch for a stalled pipeline is the wrong
 /// trade in a system whose upstream will redeliver.
+///
+/// # This constant does NOT bound the call on its own, and used to claim it did
+///
+/// It is consulted *before each sleep*, which means it only ever gates time the loop spends
+/// waiting. Time spent inside `send` is unbounded by it: the check reads `started.elapsed()`
+/// only after `send` has returned, so a `send` that never returns is never checked at all.
+/// Measured, not theorised -- with a non-resolving `send`, one virtual hour later the writer
+/// had consumed nothing and the channel was still full. That is not an exotic failure:
+/// `reqwest::Client::new()` has **no default request timeout**, so a blackholed TCP
+/// connection to the remote-write endpoint stalls the only task draining the channel forever.
+///
+/// [`PER_ATTEMPT_TIMEOUT`] is what closes that hole. The two together give the real ceiling
+/// on one `push_with_retry` call:
+///
+/// ```text
+/// MAX_TOTAL_RETRY_TIME + PER_ATTEMPT_TIMEOUT  ==  40s
+/// ```
+///
+/// The overshoot is one attempt wide because the final attempt is entered while still inside
+/// the budget and may then run to its own timeout; there is no check that can prevent that
+/// without cutting a legitimately slow request short. Pinned by
+/// `a_blackholed_endpoint_cannot_stall_the_writer_indefinitely`.
 const MAX_TOTAL_RETRY_TIME: Duration = Duration::from_secs(30);
+
+/// The longest a single `send` may run before it is abandoned and counted as a failed attempt.
+///
+/// This is the bound that makes [`MAX_TOTAL_RETRY_TIME`] mean anything, and it deliberately
+/// lives in the retry policy rather than in the caller's closure. `send` is a generic
+/// parameter: Task 11 will pass a `reqwest` client and will also set that client's own
+/// timeouts, but nothing in the type system obliges any future caller to do so, and the cost
+/// of getting it wrong is the single-threaded writer hanging forever. Defence in depth here
+/// is cheap; discovering the omission in production is not.
+///
+/// # Why ten seconds
+///
+/// The number is chosen against the budget and the default attempt count, not by feel:
+///
+/// * **Not larger.** At 30s a single hung attempt consumes the entire budget, so the
+///   pre-sleep check fires immediately afterwards and the batch is abandoned after *one*
+///   attempt -- the retry policy would stop existing for exactly the transport failures it
+///   is for.
+/// * **Not smaller.** A remote-write receiver under load, or a multi-megabyte batch over a
+///   slow link, can legitimately take seconds. At 5s a working-but-loaded remote starts
+///   being cut off and retried, adding request volume at the moment it is least wanted.
+/// * **Ten fits the arithmetic.** Three hung attempts (100ms + 200ms of backoff between
+///   them) land at 30.3s, so the default `PUSH_MAX_ATTEMPTS=3` gets all three of its attempts
+///   against a dead endpoint and the budget cuts in exactly where it should. Raising the
+///   attempt count does not extend the stall: at `PUSH_MAX_ATTEMPTS=1000` the third attempt
+///   ends at 30.3s and the pre-sleep check abandons the batch there.
+const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PushOutcome {
@@ -257,14 +306,23 @@ where
             body.clone()
         };
 
-        match send(payload).await {
-            Ok(status) if (200..300).contains(&status) => return PushOutcome::Delivered,
-            Ok(status) if !is_retryable_status(status) => {
+        // A `send` that never resolves is a *transport* failure, not a slow success, and is
+        // treated as one: it consumes an attempt, it backs off, and it lets the total budget
+        // apply. Without this wrapper the budget check below is unreachable, because it reads
+        // `started.elapsed()` only after `send` has returned.
+        match tokio::time::timeout(PER_ATTEMPT_TIMEOUT, send(payload)).await {
+            Ok(Ok(status)) if (200..300).contains(&status) => return PushOutcome::Delivered,
+            Ok(Ok(status)) if !is_retryable_status(status) => {
                 error!("remote write rejected the batch with {status}; dropping without retry");
                 return PushOutcome::Dropped;
             }
-            Ok(status) => warn!("remote write returned {status} (attempt {})", attempt + 1),
-            Err(e) => warn!("remote write failed: {e} (attempt {})", attempt + 1),
+            Ok(Ok(status)) => warn!("remote write returned {status} (attempt {})", attempt + 1),
+            Ok(Err(e)) => warn!("remote write failed: {e} (attempt {})", attempt + 1),
+            Err(_elapsed) => warn!(
+                "remote write did not respond within {}s (attempt {})",
+                PER_ATTEMPT_TIMEOUT.as_secs(),
+                attempt + 1
+            ),
         }
 
         if is_final {
@@ -310,6 +368,35 @@ pub type SeriesBatch = Vec<(Vec<Label>, Sample)>;
 ///
 /// `nothing_drains_the_channel_while_a_push_is_in_flight` pins this so that a future change
 /// making the push concurrent has to argue with a test rather than slip through.
+///
+/// # Durability: a 200 to Firehose is a promise this process cannot keep
+///
+/// This is the most important operational property of the system, so it is written here
+/// rather than left to be inferred. The handler returns 200 as soon as a batch is accepted
+/// into the channel, and 200 means "accepted" to Kinesis Firehose — it will not redeliver.
+/// But the data is only in memory: in this channel, or in this task's accumulator, or in a
+/// request in flight. **A crash, an OOM kill, a SIGKILL or a node eviction loses everything
+/// accumulated since the last successful flush, and nothing upstream will replay it.**
+///
+/// There is no write-ahead log and adding one is not obviously right. The exposure is bounded
+/// by `FLUSH_INTERVAL_SECS` (default 1s) plus whatever a push takes, so a normal restart
+/// loses on the order of a second of metrics — for CloudWatch data delivered at minute
+/// granularity and used for dashboards and alerting, that is a gap of at most one datapoint
+/// in a series that is already sampled coarsely. Paying for durability with fsyncs on the
+/// hot path, or with the operational weight of a spool directory that can itself fill up,
+/// buys very little against that.
+///
+/// What *does* follow from this, and is easy to get wrong:
+///
+/// * **`FLUSH_INTERVAL_SECS` is a durability setting, not just a batching one.** Raising it
+///   to reduce request volume raises the amount of data a crash destroys, linearly.
+/// * **Graceful shutdown matters more than it looks.** The channel-closed arm below is the
+///   only thing that saves the tail of the buffer, and it only runs if the process is allowed
+///   to finish. A `SIGKILL`, or a container `terminationGracePeriodSeconds` shorter than one
+///   flush plus one push, silently discards it — which is why that path logs what it is
+///   carrying before it attempts it.
+/// * **Replica count does not help.** Each replica buffers only what was routed to it, so
+///   losing one loses that share outright rather than degrading it.
 pub async fn run_writer<F, Fut>(mut rx: Receiver<SeriesBatch>, config: Config, mut send: F)
 where
     F: FnMut(Vec<u8>) -> Fut,
@@ -336,6 +423,13 @@ where
     // `period`, and the tick at 0 has nothing to flush.
     let mut ticker = tokio::time::interval_at(Instant::now() + period, period);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // When we last *started* talking to the remote, successful or not. Records the attempt
+    // rather than the delivery on purpose: the heartbeat exists to prove this process is
+    // alive and pushing, and a remote that is rejecting everything is not a reason to push
+    // more often. Updated after each push completes, which is also what stops a long push
+    // from being followed by a burst -- see [`IDLE_HEARTBEAT`].
+    let mut last_push_attempt = Instant::now();
 
     loop {
         let should_flush = tokio::select! {
@@ -367,9 +461,83 @@ where
         };
 
         if should_flush {
-            flush(&mut acc, &config, &mut send).await;
+            if acc.is_empty() {
+                // An idle tick. There is no CloudWatch data to send, but total silence is
+                // itself misleading -- see [`IDLE_HEARTBEAT`].
+                if last_push_attempt.elapsed() >= IDLE_HEARTBEAT {
+                    push_heartbeat(&config, &mut send).await;
+                    last_push_attempt = Instant::now();
+                }
+            } else {
+                flush(&mut acc, &config, &mut send).await;
+                last_push_attempt = Instant::now();
+            }
         }
     }
+}
+
+/// How long the writer may stay completely silent before it pushes its own metrics alone.
+///
+/// `flush` returning early on an empty accumulator is correct -- an empty CloudWatch payload
+/// is pure wire overhead -- but the consequence is that an idle exporter pushes *nothing at
+/// all*. From the remote's point of view "the exporter is dead" and "no CloudWatch data is
+/// arriving" then look identical, and every `firehose_self_*` series goes stale at exactly
+/// the moment somebody would go looking at them: `self_batches_dropped_count`,
+/// `self_records_skipped_count` and `queue_freshness_seconds` are most interesting when the
+/// pipeline has gone quiet, and that is precisely when they stop being exported.
+///
+/// A constant rather than another environment variable on purpose. This is a liveness signal,
+/// not a tuning knob: too fast and it is pointless request volume, too slow and it stops being
+/// a heartbeat. Sixty seconds sits comfortably inside the staleness window of every common
+/// scrape interval while costing one request a minute from a replica that is doing nothing.
+const IDLE_HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// Push self-metrics on their own, with no CloudWatch series attached.
+///
+/// Deliberately *not* a `flush`: nothing is drained, `BUFFER_SERIES` and `FLUSH_DURATION` are
+/// left alone (this is not a flush and reporting it as one would corrupt both), and a failure
+/// does **not** increment `BATCHES_DROPPED` -- no CloudWatch data was lost, so counting it
+/// there would make the data-loss counter fire during an outage in which no data existed.
+/// `push_with_retry` already logs the failure, which is the whole of what is owed here.
+async fn push_heartbeat<F, Fut>(config: &Config, send: &mut F)
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: Future<Output = anyhow::Result<u16>>,
+{
+    push_series_only(self_metric_series(), config, send).await
+}
+
+/// Push exactly these series and nothing else.
+///
+/// Split from [`push_heartbeat`] so the empty case can be *reached*. That case is not
+/// theoretical the way the encode arms elsewhere in this module are: `self_metric_series`
+/// returns an empty vec whenever the registry fails to convert, and the way that happens in
+/// practice is somebody registering a histogram — see the note on the `lazy_static!` block in
+/// `prometheus.rs`. In that state, without the guard, the writer would push a **completely
+/// empty `WriteRequest` every sixty seconds forever**, which some receivers reject and all of
+/// them count as traffic, while the operator sees a healthy-looking request rate from an
+/// exporter that is in fact exporting nothing.
+///
+/// Driving it through `push_heartbeat` would mean registering a histogram in the global
+/// registry, which never gets torn down and would empty the self-metric payload for every
+/// other test in the binary. The seam costs one function; the alternative costs the suite.
+async fn push_series_only<F, Fut>(series: Vec<TimeSeries>, config: &Config, send: &mut F)
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: Future<Output = anyhow::Result<u16>>,
+{
+    if series.is_empty() {
+        return;
+    }
+
+    let body = match build_request(vec![], series).encode_compressed() {
+        Ok(b) => b,
+        Err(e) => {
+            error!("could not encode heartbeat: {e}");
+            return;
+        }
+    };
+    push_with_retry(body, config.push_max_attempts, &mut *send).await;
 }
 
 /// Drain the accumulator into one request and push it, or account for losing it.
@@ -1479,6 +1647,171 @@ mod tests {
         }
     }
 
+    /// A `send` that never resolves must be abandoned, not waited on.
+    ///
+    /// This is the hole `PER_ATTEMPT_TIMEOUT` exists to close, and it was a live bug rather
+    /// than a hypothetical: `MAX_TOTAL_RETRY_TIME` is only consulted before a *sleep*, and it
+    /// reads `started.elapsed()` after `send` has already returned — so a `send` that never
+    /// returns is never checked. `reqwest::Client::new()` sets no default request timeout, so
+    /// a blackholed connection to the remote-write endpoint would hang the one task draining
+    /// the channel, permanently, with no liveness signal.
+    ///
+    /// The whole call is wrapped in `within` so that deleting the timeout fails this test
+    /// instead of hanging the suite forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_that_never_responds_is_abandoned_and_counted_as_a_failed_attempt() {
+        let _log = LogTail::start();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let outcome = within(
+            "push_with_retry to give up on a non-resolving send",
+            push_with_retry(vec![1], 3, move |_body| {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    // Never resolves, exactly like a connection to a blackholed endpoint.
+                    std::future::pending::<anyhow::Result<u16>>().await
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome, PushOutcome::Dropped);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "a timed-out attempt must consume an attempt like any other transport failure"
+        );
+    }
+
+    /// The timeout must be *retryable*, not fatal. A single stalled connection followed by a
+    /// working one is the ordinary shape of a receiver restarting behind a load balancer;
+    /// treating the elapse as a hard drop would discard a batch the very next attempt would
+    /// have delivered.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_attempt_is_retried_and_can_still_succeed() {
+        let _log = LogTail::start();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let outcome = within(
+            "a retry after a timeout",
+            push_with_retry(vec![1], 3, move |_body| {
+                let c = c.clone();
+                async move {
+                    if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::future::pending::<anyhow::Result<u16>>().await
+                    } else {
+                        Ok(200u16)
+                    }
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome, PushOutcome::Delivered);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The other side of the bound: a request that is merely *slow* must not be cut off.
+    /// A loaded remote-write receiver, or a multi-megabyte batch over a slow link, can
+    /// legitimately take seconds — and a timeout that fired on those would add request volume
+    /// at exactly the moment the receiver is least able to absorb it. Nine virtual seconds is
+    /// inside the ten-second bound and must deliver on the first attempt.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_responsive_send_is_not_cut_off() {
+        let _log = LogTail::start();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+
+        let outcome = within(
+            "a slow success",
+            push_with_retry(vec![1], 3, move |_body| {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(PER_ATTEMPT_TIMEOUT - Duration::from_secs(1)).await;
+                    Ok(200u16)
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome, PushOutcome::Delivered);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a request inside the bound must not be retried"
+        );
+    }
+
+    /// The ceiling on the whole call, stated as a number rather than as an intention.
+    ///
+    /// `MAX_TOTAL_RETRY_TIME` alone never bounded this — see its doc comment. With the
+    /// per-attempt timeout in place the worst case is one budget plus one attempt, because
+    /// the final attempt is entered while still inside the budget and may then run to its own
+    /// timeout. A thousand attempts against a dead endpoint must therefore cost ~30s of
+    /// writer stall, not eight minutes and not forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_blackholed_endpoint_cannot_stall_the_writer_indefinitely() {
+        let _log = LogTail::start();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let started = Instant::now();
+
+        let outcome = within(
+            "a bounded give-up against a blackholed endpoint",
+            push_with_retry(vec![1], 1000, move |_body| {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<anyhow::Result<u16>>().await
+                }
+            }),
+        )
+        .await;
+
+        let elapsed = started.elapsed();
+        let ceiling = MAX_TOTAL_RETRY_TIME + PER_ATTEMPT_TIMEOUT;
+        assert_eq!(outcome, PushOutcome::Dropped);
+        assert!(
+            elapsed <= ceiling,
+            "stalled the writer for {elapsed:?}; the documented ceiling is {ceiling:?}"
+        );
+        let calls = calls.load(Ordering::SeqCst);
+        assert!(
+            calls < 1000,
+            "the budget must cut the loop short of the attempt count, made {calls} calls"
+        );
+        assert!(
+            calls > 1,
+            "a hung endpoint must still be retried, not abandoned after one attempt: {calls}"
+        );
+    }
+
+    /// The elapse must be diagnosable. "Nothing happened for ten seconds" and "the connection
+    /// was refused" call for completely different investigations — one is a network path or a
+    /// hung receiver, the other is a wrong address or a dead process — so the log must not
+    /// collapse them into a single "remote write failed".
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_attempt_says_it_timed_out() {
+        let tail = LogTail::start();
+        within(
+            "a timed-out push",
+            push_with_retry(vec![1], 1, |_body| async {
+                std::future::pending::<anyhow::Result<u16>>().await
+            }),
+        )
+        .await;
+        let logs = tail.tail();
+
+        assert!(
+            logs.contains("did not respond within 10s"),
+            "a timeout must be distinguishable from a transport error, got: {logs}"
+        );
+    }
+
     /// Giving up must be visible. A batch that vanishes with nothing in the log is
     /// indistinguishable from a batch that was delivered, and the whole point of a bounded
     /// retry is that the bound is observable when it is hit.
@@ -1604,6 +1937,19 @@ mod tests {
         )]
     }
 
+    /// Decode the bytes the writer actually pushed.
+    ///
+    /// Asserting on the pushed *body* rather than on the `WriteRequest` that was built is a
+    /// different and stronger claim: the encode step sits between the two, and it is where
+    /// "the body is snappy-compressed protobuf the remote can read" is either true or
+    /// silently not. Both `expect`s below are part of the assertion, not ceremony.
+    fn decode_body(body: &[u8]) -> WriteRequest {
+        let raw = snap::raw::Decoder::new()
+            .decompress_vec(body)
+            .expect("body must be snappy-compressed");
+        prost::Message::decode(raw.as_slice()).expect("body must decode as a WriteRequest")
+    }
+
     /// A sound synchronisation point under `start_paused`, and the reason these tests do not
     /// need retries or generous windows.
     ///
@@ -1624,8 +1970,14 @@ mod tests {
     /// return — produce exactly that, and a hung CI job is a much worse signal than a failed
     /// one: it reports nothing, it reports it slowly, and it usually gets retried. The bound
     /// is sixty *virtual* seconds, so it costs a healthy test nothing.
+    ///
+    /// The bound must stay comfortably clear of every deadline a test legitimately waits on,
+    /// `IDLE_HEARTBEAT` above all. At sixty seconds it *tied* with the heartbeat's own
+    /// deadline and won, so `the_idle_heartbeat_fires_once_per_quiet_period` failed
+    /// against a perfectly correct heartbeat. Expressed as a multiple of `IDLE_HEARTBEAT` so
+    /// retuning that constant cannot silently reintroduce the collision.
     async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
-        match tokio::time::timeout(Duration::from_secs(60), fut).await {
+        match tokio::time::timeout(IDLE_HEARTBEAT * 5, fut).await {
             Ok(value) => value,
             Err(_) => panic!("timed out waiting for {what}"),
         }
@@ -1797,18 +2149,27 @@ mod tests {
     /// return produces a perfectly non-empty body containing nothing but this process's own
     /// counters, ten times a second, forever. Only "no push happened" catches that.
     #[tokio::test(start_paused = true)]
-    async fn an_idle_writer_never_pushes_at_all() {
+    async fn an_idle_writer_pushes_nothing_before_the_heartbeat_is_due() {
         let _log = LogTail::start();
         let (send, mut flushes) = flush_spy(200);
         let (tx, rx) = mpsc::channel(16);
         let config = Config::from_values(Some("1"), Some("100000"), None, Some("1"));
         let handle = tokio::spawn(run_writer(rx, config, send));
 
-        // Ten flush intervals with nothing buffered.
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Deliberately inside the heartbeat window: this test owns the "an empty tick sends
+        // nothing" property, and `the_idle_heartbeat_fires_once_per_quiet_period`
+        // owns the property that silence eventually ends. Asserting the relationship rather
+        // than hardcoding ten seconds keeps them from drifting into contradiction if
+        // `IDLE_HEARTBEAT` is ever retuned.
+        let quiet = Duration::from_secs(10);
+        assert!(
+            quiet < IDLE_HEARTBEAT,
+            "this test is only meaningful inside the heartbeat window"
+        );
+        tokio::time::sleep(quiet).await;
         assert!(
             flushes.try_recv().is_err(),
-            "an idle tick must not push a self-metrics-only body"
+            "an idle tick must not push a self-metrics-only body before the heartbeat is due"
         );
 
         drop(tx);
@@ -1817,6 +2178,213 @@ mod tests {
             flushes.try_recv().is_err(),
             "shutdown with nothing buffered must not push either"
         );
+    }
+
+    /// Silence must eventually end. An exporter that pushes nothing while idle is
+    /// indistinguishable at the remote from an exporter that has died, and every
+    /// `firehose_self_*` series goes stale exactly when someone would go looking at it.
+    ///
+    /// The assertion is on the exact virtual instant, which is what makes this a test of the
+    /// heartbeat rather than of "something eventually happened": the heartbeat is due
+    /// `IDLE_HEARTBEAT` after the last push *attempt*, so a first flush at t=1s puts the
+    /// heartbeat at t=61s and nowhere else.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_heartbeat_fires_once_per_quiet_period() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values(Some("1"), Some("100000"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, send));
+
+        // A real flush first, so the heartbeat clock starts from a known push rather than
+        // from the writer's construction.
+        tx.send(batch("cloudwatch_only_series", 1)).await.unwrap();
+        let first = within("the interval flush", flushes.recv())
+            .await
+            .expect("the interval must flush the batch");
+        let flushed_at = Instant::now();
+
+        let heartbeat = within("the idle heartbeat", flushes.recv())
+            .await
+            .expect("an idle writer must eventually push its own metrics");
+        assert_eq!(
+            flushed_at.elapsed(),
+            IDLE_HEARTBEAT,
+            "the heartbeat must fire one quiet period after the last push, not sooner or later"
+        );
+
+        // The heartbeat carries self-metrics and NO CloudWatch series. The series from the
+        // first flush is the discriminator: it was drained, so it must not reappear.
+        let first = decode_body(&first);
+        assert!(
+            find_series(&first.timeseries, "cloudwatch_only_series").is_some(),
+            "control: the first push really did carry the CloudWatch series"
+        );
+
+        let heartbeat = decode_body(&heartbeat);
+        assert!(
+            find_series(&heartbeat.timeseries, "firehose_self_buffer_series").is_some(),
+            "the heartbeat must carry the app's own metrics -- that is its entire purpose"
+        );
+        assert!(
+            find_series(&heartbeat.timeseries, "cloudwatch_only_series").is_none(),
+            "the heartbeat must not resurrect drained CloudWatch series"
+        );
+
+        // No series may appear twice. `sorted()` does not deduplicate — two `TimeSeries`
+        // sharing a label set stay two entries and the receiver reads them as duplicate
+        // samples for one series, which is the error this whole pipeline exists to avoid.
+        // The heartbeat builds its payload from one source, so a duplicate here means
+        // something is feeding `build_request` the same series on both sides.
+        let mut seen = std::collections::HashSet::new();
+        for series in &heartbeat.timeseries {
+            let key: Vec<(&str, &str)> = series
+                .labels
+                .iter()
+                .map(|l| (l.name.as_str(), l.value.as_str()))
+                .collect();
+            assert!(
+                seen.insert(key.clone()),
+                "the heartbeat pushed the same label set twice: {key:?}"
+            );
+        }
+
+        // A heartbeat, not a heartbeat storm. `last_push_attempt` must be restamped by the
+        // heartbeat itself; if it is not, every subsequent tick also sees a quiet period
+        // elapsed and the writer pushes once per `FLUSH_INTERVAL_SECS` forever — sixty times
+        // the intended request volume, from a replica that is doing nothing.
+        let first_beat_at = Instant::now();
+        within("a second heartbeat", flushes.recv())
+            .await
+            .expect("the heartbeat must keep repeating while idle");
+        assert_eq!(
+            first_beat_at.elapsed(),
+            IDLE_HEARTBEAT,
+            "heartbeats must be one quiet period apart, not one flush interval apart"
+        );
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+    }
+
+    /// An empty heartbeat must not go on the wire at all.
+    ///
+    /// This is reachable in production, unlike the encode guards elsewhere in this module:
+    /// `self_metric_series` returns empty whenever the registry fails to convert, and the way
+    /// that happens is a registered histogram. Without the guard the writer would push a
+    /// completely empty `WriteRequest` once a quiet period, forever — traffic that looks
+    /// healthy on a request-rate graph and carries nothing at all, from an exporter that has
+    /// silently stopped exporting.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_heartbeat_is_not_pushed() {
+        let _log = LogTail::start();
+        let (mut send, mut flushes) = flush_spy(200);
+        let config = Config::from_values(Some("1"), Some("100000"), None, Some("1"));
+
+        push_series_only(vec![], &config, &mut send).await;
+        assert!(
+            flushes.try_recv().is_err(),
+            "an empty series list must not produce a request"
+        );
+
+        // Control: the same call with real series does push, so the assertion above is about
+        // the guard and not about `push_series_only` being inert.
+        push_series_only(self_metric_series(), &config, &mut send).await;
+        assert!(
+            flushes.try_recv().is_ok(),
+            "CONTROL: a non-empty series list must push"
+        );
+    }
+
+    /// A heartbeat that fails must not be counted as lost data. `BATCHES_DROPPED` is the
+    /// signal that CloudWatch samples were destroyed, and a heartbeat carries none — it is
+    /// rebuilt from the registry every time and nothing is drained to produce it. Counting it
+    /// would make the data-loss counter climb steadily during an outage in which no data
+    /// existed to lose, which is precisely when someone is reading that counter to decide how
+    /// bad things are.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_heartbeat_is_not_counted_as_dropped_data() {
+        let _log = LogTail::start();
+        let before = BATCHES_DROPPED.get();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values(Some("1"), Some("100000"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, move |_body| {
+            let c = c.clone();
+            c.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(503u16))
+        }));
+
+        // Nothing is ever sent, so the only thing that can push here is the heartbeat.
+        tokio::time::sleep(IDLE_HEARTBEAT + Duration::from_secs(5)).await;
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "control: the heartbeat must actually have been attempted"
+        );
+        assert_eq!(
+            BATCHES_DROPPED.get(),
+            before,
+            "a failed heartbeat loses no CloudWatch data and must not touch the drop counter"
+        );
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+    }
+
+    /// The heartbeat must not be able to mask a stall, which is the failure mode that would
+    /// make it worse than useless: a long push suppresses ticks, and if those ticks queued up
+    /// they would fire as a burst the moment the push returned, painting a healthy-looking
+    /// run of heartbeats over the exact window in which the exporter was wedged.
+    ///
+    /// Two things prevent it, and this test covers both together.
+    /// `MissedTickBehavior::Delay` reschedules from the tick that was actually serviced rather
+    /// than replaying the missed ones, and `last_push_attempt` is stamped when the push
+    /// *completes*. So a thirty-second push is followed by a full quiet period of silence, not
+    /// by thirty seconds' worth of backlogged heartbeats.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_push_is_not_followed_by_a_burst_of_heartbeats() {
+        let _log = LogTail::start();
+        let pushes = Arc::new(AtomicUsize::new(0));
+        let p = pushes.clone();
+        let (tx, rx) = mpsc::channel(16);
+
+        // A slow *success*, deliberately inside `PER_ATTEMPT_TIMEOUT`. The first draft used
+        // thirty seconds and was silently measuring something else entirely: the per-attempt
+        // timeout abandoned the push at ten, so the test observed a timed-out attempt rather
+        // than a long one. Derived from the constant so it cannot drift out of range again.
+        let slow_push = PER_ATTEMPT_TIMEOUT - Duration::from_secs(2);
+        assert!(
+            slow_push < PER_ATTEMPT_TIMEOUT,
+            "this test needs a push that completes, not one that is abandoned"
+        );
+
+        // Threshold of one so the batch pushes immediately; at a one-second interval, seven
+        // ticks are missed while the push runs.
+        let config = Config::from_values(Some("1"), Some("1"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, move |_body| {
+            let p = p.clone();
+            async move {
+                p.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(slow_push).await;
+                Ok(200u16)
+            }
+        }));
+
+        tx.send(batch("a", 1)).await.unwrap();
+        // Past the end of the push and still inside the quiet period that must follow it:
+        // the heartbeat is due `slow_push + IDLE_HEARTBEAT` in, so a full `IDLE_HEARTBEAT`
+        // from t=0 is comfortably before it and comfortably after the missed ticks.
+        tokio::time::sleep(IDLE_HEARTBEAT).await;
+
+        assert_eq!(
+            pushes.load(Ordering::SeqCst),
+            1,
+            "the missed ticks must not replay as a burst of heartbeats once the push returns"
+        );
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
     }
 
     /// The threshold is a `>=` on a count, so it has two ways to be wrong and this watches
@@ -2091,13 +2659,7 @@ mod tests {
         within("the writer to exit", handle).await.unwrap();
 
         let body = flushes.recv().await.expect("shutdown must flush");
-        let decoded: WriteRequest = prost::Message::decode(
-            snap::raw::Decoder::new()
-                .decompress_vec(&body)
-                .expect("body must be snappy-compressed")
-                .as_slice(),
-        )
-        .expect("body must be a WriteRequest");
+        let decoded = decode_body(&body);
 
         for name in ["multi", "second", "third"] {
             let found = find_series(&decoded.timeseries, name)
