@@ -1,4 +1,5 @@
 pub(crate) mod aws;
+mod config;
 mod consts;
 mod prometheus;
 mod series;
