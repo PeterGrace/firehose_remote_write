@@ -1,6 +1,6 @@
 use crate::aws::{get_dimensions, AWSState};
 use crate::consts::PROM_NAMESPACE;
-use crate::structs::{CloudWatchMetric, MetricUnit};
+use crate::structs::{CloudWatchMetric, LabelsValues, MetricUnit};
 use axum::http::StatusCode;
 use convert_case::{Case, Casing};
 use lazy_static::lazy_static;
@@ -138,6 +138,41 @@ pub async fn clear_collectors() {
     collectors.clear();
 }
 
+/// Record one CloudWatch aggregate (max/min/sum/count) of a datapoint as a gauge sample.
+///
+/// A record may carry a dimension that is absent from `ordered_labels`, in which case the
+/// value list is wider than the registered gauge's label list. That must surface as an
+/// error rather than a panic: the caller skips the offending record and moves on.
+async fn record_aggregate<'a>(
+    metric_name: &str,
+    suffix: &str,
+    value: f64,
+    timestamp_ms: i64,
+    lv_tree: &BTreeMap<&'a str, &'a str>,
+    ordered_labels: &[&str],
+    dims: &'a [LabelsValues],
+) -> anyhow::Result<()> {
+    let mut local_lv_tree = lv_tree.clone();
+    for dim in dims.iter() {
+        local_lv_tree.insert(dim.key.as_str(), dim.value.as_str());
+    }
+    let ordered_values: Vec<&str> = local_lv_tree.values().copied().collect();
+    let full_metric_name = format!("{metric_name}_{suffix}");
+    let outgoing_gauge = get_or_register_metric(full_metric_name, ordered_labels).await;
+
+    let m = outgoing_gauge
+        .get_metric_with_label_values(&ordered_values)
+        .map_err(|e| {
+            if let Error::InconsistentCardinality { .. } = e {
+                warn!("{metric_name}_{suffix} inconsistent cardinality\n labels: {ordered_labels:#?}\nvalues: {ordered_values:#?}");
+            }
+            anyhow!(e)
+        })?;
+    m.set_timestamp_ms(timestamp_ms);
+    m.set(value);
+    Ok(())
+}
+
 pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<()> {
     let namespace: String = incoming_metric
         .clone()
@@ -185,72 +220,24 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
         | MetricUnit::Milliseconds
         | MetricUnit::Microseconds
         | MetricUnit::None => {
-            if incoming_metric.value.max.is_some() {
-                let mut local_lv_tree = lv_tree.clone();
-                for dim in dims.iter() {
-                    local_lv_tree.insert(dim.key.as_str(), dim.value.as_str());
+            for (suffix, value) in [
+                ("max", incoming_metric.value.max),
+                ("min", incoming_metric.value.min),
+                ("sum", incoming_metric.value.sum),
+                ("count", incoming_metric.value.count),
+            ] {
+                if let Some(value) = value {
+                    record_aggregate(
+                        &metric_name,
+                        suffix,
+                        value as f64,
+                        incoming_metric.timestamp,
+                        &lv_tree,
+                        &ordered_labels,
+                        &dims,
+                    )
+                    .await?;
                 }
-                let ordered_values: Vec<&str> = local_lv_tree.iter().map(|(k, v)| *v).collect();
-                let full_metric_name = format!("{metric_name}_max");
-                let outgoing_gauge =
-                    get_or_register_metric(full_metric_name, &ordered_labels).await;
-                let m = match outgoing_gauge.get_metric_with_label_values(&ordered_values) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        match e {
-                            Error::AlreadyReg => {}
-                            Error::InconsistentCardinality { .. } => {
-                                warn!("{metric_name} inconsistent cardinality\n labels: {ordered_labels:#?}\nvalues: {ordered_values:#?}");
-                            }
-                            Error::Msg(_) => {}
-                            Error::Io(_) => {}
-                            Error::Protobuf(_) => {}
-                        }
-                        return Err(anyhow!(e));
-                    }
-                };
-                m.set_timestamp_ms(incoming_metric.timestamp as i64);
-                m.set(incoming_metric.value.max.unwrap() as f64);
-            }
-            if incoming_metric.value.min.is_some() {
-                let mut local_lv_tree = lv_tree.clone();
-                for dim in dims.iter() {
-                    local_lv_tree.insert(dim.key.as_str(), dim.value.as_str());
-                }
-                let ordered_values: Vec<&str> = local_lv_tree.iter().map(|(k, v)| *v).collect();
-                let full_metric_name = format!("{metric_name}_min");
-                let outgoing_gauge =
-                    get_or_register_metric(full_metric_name, &ordered_labels).await;
-
-                let m = outgoing_gauge.with_label_values(&ordered_values.clone());
-                m.set_timestamp_ms(incoming_metric.timestamp as i64);
-                m.set(incoming_metric.value.min.unwrap() as f64);
-            }
-            if incoming_metric.value.sum.is_some() {
-                let mut local_lv_tree = lv_tree.clone();
-                for dim in dims.iter() {
-                    local_lv_tree.insert(dim.key.as_str(), dim.value.as_str());
-                }
-                let ordered_values: Vec<&str> = local_lv_tree.iter().map(|(k, v)| *v).collect();
-                let full_metric_name = format!("{metric_name}_sum");
-                let outgoing_gauge =
-                    get_or_register_metric(full_metric_name, &ordered_labels).await;
-                let m = outgoing_gauge.with_label_values(&ordered_values.clone());
-                m.set_timestamp_ms(incoming_metric.timestamp as i64);
-                m.set(incoming_metric.value.sum.unwrap() as f64);
-            }
-            if incoming_metric.value.count.is_some() {
-                let mut local_lv_tree = lv_tree.clone();
-                for dim in dims.iter() {
-                    local_lv_tree.insert(dim.key.as_str(), dim.value.as_str());
-                }
-                let ordered_values: Vec<&str> = local_lv_tree.iter().map(|(k, v)| *v).collect();
-                let full_metric_name = format!("{metric_name}_count");
-                let outgoing_gauge =
-                    get_or_register_metric(full_metric_name, &ordered_labels).await;
-                let m = outgoing_gauge.with_label_values(&ordered_values);
-                m.set_timestamp_ms(incoming_metric.timestamp as i64);
-                m.set(incoming_metric.value.count.unwrap() as f64);
             }
         }
         // MetricUnit::Count => {
@@ -271,13 +258,129 @@ pub fn sanitize_metric_name(input: String) -> String {
         .collect::<String>()
 }
 
-pub async fn get_or_register_metric(metric_name: String, ordered_labels: &Vec<&str>) -> GaugeVec {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Seed the dimension cache so `record_metric` does not call out to AWS, and so the
+    /// test controls exactly which dimension names it believes the metric has.
+    async fn seed_dimensions(metric: &str, dims: &[&str]) {
+        DIMENSION_HASH.lock().await.insert(
+            format!("us-east-1.AWS/Test.{metric}"),
+            dims.iter().map(|s| s.to_string()).collect(),
+        );
+    }
+
+    /// A record carrying two dimensions, with only the named aggregate populated.
+    fn metric_with(metric_name: &str, value: &str) -> CloudWatchMetric {
+        let json = format!(
+            r#"{{"metric_stream_name":"test-stream","account_id":"123456789012",
+                 "region":"us-east-1","namespace":"AWS/Test","metric_name":"{metric_name}",
+                 "dimensions":{{"LoadBalancer":"app/foo","TargetGroup":"tg/bar"}},
+                 "timestamp":1700000000000,"value":{value},"unit":"Count"}}"#
+        );
+        serde_json::from_str(&json).expect("test fixture should deserialize")
+    }
+
+    // The seeded dimension set omits `target_group`, so the record carries a dimension the
+    // registered GaugeVec has no label for. That is the InconsistentCardinality condition
+    // the `max` branch already handles; these three branches must not panic on it either.
+
+    /// Characterization test guarding the extraction of `record_aggregate`: it pins the
+    /// label/value pairing and the sample itself, which the error-path tests below cannot
+    /// see. Written after the refactor and expected to pass on both sides of it.
+    #[tokio::test]
+    async fn record_metric_writes_sample_with_matching_labels() {
+        seed_dimensions("HappyPath", &["load_balancer", "target_group"]).await;
+        record_metric(metric_with("HappyPath", r#"{"max":42.0}"#))
+            .await
+            .expect("matching label set should record cleanly");
+
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.get_name() == "firehose_test_happypath_count_max")
+            .expect("metric family should be registered");
+        let sample = &family.get_metric()[0];
+
+        assert_eq!(sample.get_gauge().get_value(), 42.0);
+        assert_eq!(sample.get_timestamp_ms(), 1700000000000);
+
+        let labels: BTreeMap<&str, &str> = sample
+            .get_label()
+            .iter()
+            .map(|l| (l.get_name(), l.get_value()))
+            .collect();
+        assert_eq!(labels.get("load_balancer"), Some(&"app/foo"));
+        assert_eq!(labels.get("target_group"), Some(&"tg/bar"));
+        assert_eq!(labels.get("metric_stream_name"), Some(&"test-stream"));
+        assert_eq!(labels.get("account_id"), Some(&"123456789012"));
+        assert_eq!(labels.get("region"), Some(&"us-east-1"));
+    }
+
+    /// Pin the failure mode, not just "some error". Without this a future change that made
+    /// `record_metric` fail earlier for an unrelated reason would keep these tests green
+    /// while no longer exercising the panic path they exist to guard.
+    fn assert_inconsistent_cardinality(err: anyhow::Error) {
+        match err.downcast_ref::<Error>() {
+            Some(Error::InconsistentCardinality { .. }) => {}
+            _ => panic!("expected InconsistentCardinality, got: {err:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_metric_errors_on_cardinality_mismatch_for_min() {
+        seed_dimensions("MinOnly", &["load_balancer"]).await;
+        let metric = metric_with("MinOnly", r#"{"min":1.0}"#);
+        let err = record_metric(metric).await.expect_err("should not record");
+        assert_inconsistent_cardinality(err);
+    }
+
+    #[tokio::test]
+    async fn record_metric_errors_on_cardinality_mismatch_for_sum() {
+        seed_dimensions("SumOnly", &["load_balancer"]).await;
+        let metric = metric_with("SumOnly", r#"{"sum":1.0}"#);
+        let err = record_metric(metric).await.expect_err("should not record");
+        assert_inconsistent_cardinality(err);
+    }
+
+    #[tokio::test]
+    async fn record_metric_errors_on_cardinality_mismatch_for_count() {
+        seed_dimensions("CountOnly", &["load_balancer"]).await;
+        let metric = metric_with("CountOnly", r#"{"count":1.0}"#);
+        let err = record_metric(metric).await.expect_err("should not record");
+        assert_inconsistent_cardinality(err);
+    }
+
+    /// `max` is evaluated first and fails on the mismatched label set, so `min` must never
+    /// be reached. `get_or_register_metric` runs before the label lookup, so the presence
+    /// of a gauge in GAUGES is the observable signal that an aggregate was attempted.
+    #[tokio::test]
+    async fn record_metric_stops_at_first_failing_aggregate() {
+        seed_dimensions("ShortCircuit", &["load_balancer"]).await;
+        let metric = metric_with("ShortCircuit", r#"{"max":1.0,"min":2.0}"#);
+        let err = record_metric(metric).await.expect_err("should not record");
+        assert_inconsistent_cardinality(err);
+
+        let gauges = GAUGES.lock().await;
+        assert!(
+            gauges.contains_key("test_shortcircuit_count_max"),
+            "max should have been attempted before failing"
+        );
+        assert!(
+            !gauges.contains_key("test_shortcircuit_count_min"),
+            "min must not be reached once max has failed"
+        );
+    }
+}
+
+pub async fn get_or_register_metric(metric_name: String, ordered_labels: &[&str]) -> GaugeVec {
     let mut recorder = GAUGES.lock().await;
     match recorder.get(&metric_name) {
         None => {
             let gv = register_gauge_vec!(
                 app_opts!(metric_name.clone(), "autogenerated metric from firehose"),
-                &ordered_labels
+                ordered_labels
             )
             .unwrap();
             recorder.insert(metric_name.clone(), gv.clone());
