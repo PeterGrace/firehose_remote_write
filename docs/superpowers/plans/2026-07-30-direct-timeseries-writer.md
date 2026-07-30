@@ -1352,6 +1352,12 @@ pub fn build_request(cloudwatch: Vec<TimeSeries>, self_metrics: Vec<TimeSeries>)
 /// Self-metrics legitimately belong on the client registry; only the CloudWatch path
 /// needed to move off it. Returns an empty vec on failure rather than losing the
 /// CloudWatch data that shares this flush.
+///
+/// THIS IS THE ONLY PATH SELF-METRICS TAKE TO THE WIRE once Task 11 deletes
+/// `push_firehose_metrics`. If this function is not called from the flush, every
+/// `self_*` counter and gauge becomes write-only: incremented forever, never exported,
+/// and invisible exactly when something is going wrong. Task 9's `flush` must call it,
+/// and a test must assert self-metrics appear in the pushed request.
 pub fn self_metric_series() -> Vec<TimeSeries> {
     let families = prometheus::gather();
     let text = match TextEncoder::new().encode_to_string(&families) {
