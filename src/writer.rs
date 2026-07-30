@@ -426,10 +426,32 @@ where
         BATCHES_DROPPED.inc();
     }
 
-    // Sound because this task is the only writer of `acc` and it is inside `flush`: no batch
-    // can have been accumulated during the push. Anything that arrived is still in the
-    // channel, uncounted, and will set this again on the next receive.
+    // Both of these writes are correct and NEITHER is ever exported by the flush that made
+    // them. `self_metric_series()` above gathers the registry while building *this* payload,
+    // so what goes on the wire is the value each gauge held at gather time. Read the help
+    // text in `prometheus.rs` before concluding either of these is off by one -- they are
+    // phrased against this ordering, deliberately.
+    //
+    // `BUFFER_SERIES`: sound because this task is the only writer of `acc` and it is inside
+    // `flush`, so no batch can have been accumulated during the push -- anything that arrived
+    // is still in the channel, uncounted, and will set this again on the next receive. But
+    // the next receive is also what overwrites this 0 before anyone gathers it, so the
+    // exported value is always the pre-drain depth and the remote never sees 0 at all.
     BUFFER_SERIES.set(0.0);
+
+    // `FLUSH_DURATION`: exported one flush late, and not fixable without gathering twice.
+    // The duration cannot be known until the push returns, and the payload carrying it was
+    // built before the push began -- so flush N's own duration first reaches the wire inside
+    // flush N+1. Ordering these two lines differently does not help; the only fix is a second
+    // gather after the push, which means a second request. Recorded because the symptom
+    // ("the graph lags the incident by exactly one scrape") reads like an off-by-one bug and
+    // is not one.
+    //
+    // Also worth knowing before trusting this metric: it is a gauge sampled once per flush,
+    // so at a 1s interval a 15-60s scrape sees one flush in 15-60, chosen arbitrarily. It
+    // will show a sustained slowdown and can miss a 30s retry stall entirely. A `_total`
+    // counter pair or a max-since-export gauge would fix that; a histogram CANNOT be used
+    // here -- see the note on the `lazy_static!` block in `prometheus.rs`.
     FLUSH_DURATION.set(started.elapsed().as_secs_f64());
 }
 

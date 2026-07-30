@@ -57,6 +57,35 @@ type HistoHash = Arc<Mutex<HashMap<String, HistogramVec>>>;
 
 type DimensionHash = Arc<Mutex<HashMap<String, Vec<String>>>>;
 
+// # NO HISTOGRAM OR SUMMARY MAY BE REGISTERED IN THIS BLOCK
+//
+// Not a style preference. Self-metrics reach the remote through
+// `writer::self_metric_series`, which is `prometheus::gather()` -> `TextEncoder` ->
+// `WriteRequest::from_text_format`. That last step calls `samples_to_timeseries`, which
+// returns `Err("histogram not supported yet")` on the first histogram or summary sample it
+// meets -- and the `?` propagating it **discards every series already parsed**. It fails the
+// whole payload, not the offending family.
+//
+// So one registered histogram anywhere in this process silently zeroes *every* self-metric
+// on *every* flush, for as long as it stays registered. The CloudWatch data keeps flowing,
+// the process keeps serving, nothing crashes, and the only trace is one `error!` line per
+// flush saying "could not convert self-metrics". The dashboards for the exporter itself go
+// flat at exactly the moment you would want to look at them.
+//
+// This is easy to trip over because the instinct that leads here is a reasonable one:
+// somebody wants latency percentiles for `self_flush_duration_seconds` and reaches for the
+// obvious tool. Workable shapes through the text format:
+//
+// * a `_total` counter pair -- `self_x_seconds_total` and `self_x_count_total` -- giving a
+//   `rate()`-able average;
+// * a max-since-last-export gauge, if the tail is what matters.
+//
+// Both are plain counters/gauges and both round-trip. `register_histogram_vec` and
+// `app_histogram_opts!` are imported and the `HISTOGRAMS` map exists, but nothing populates
+// either today, and `histograms_are_rejected_by_the_self_metric_text_round_trip` pins the
+// consequence if that changes. Anything genuinely needing native histograms has to bypass
+// the text format entirely and build `TimeSeries` directly, the way the CloudWatch path now
+// does.
 lazy_static! {
     pub static ref GAUGES: GaugeHash = Arc::new(Mutex::new(HashMap::new()));
     pub static ref COUNTERS: CounterHash = Arc::new(Mutex::new(HashMap::new()));
@@ -114,14 +143,19 @@ lazy_static! {
         "Payloads rejected because the buffer was full"
     ))
     .unwrap();
+    // Help text measured against what the metric actually exports, not against what it is
+    // named. `writer::flush` gathers self-metrics *inside* the payload it is building, so the
+    // value that reaches the remote is the one held at gather time -- never the value written
+    // after the push. Both of these therefore describe a moment, and the moment is not the
+    // one the obvious reading suggests. See the comments at their `set` call sites.
     pub static ref BUFFER_SERIES: Gauge = register_gauge!(self_metric_opts!(
         "self_buffer_series",
-        "Series currently buffered awaiting flush"
+        "Series buffered at the moment the most recent flush began (never observed as 0: the reset after a push is not itself exported)"
     ))
     .unwrap();
     pub static ref FLUSH_DURATION: Gauge = register_gauge!(self_metric_opts!(
         "self_flush_duration_seconds",
-        "Duration of the most recent flush"
+        "Duration of the flush BEFORE the most recent one; the current flush's duration is not known until after its own payload has been built"
     ))
     .unwrap();
 }
@@ -563,6 +597,88 @@ mod tests {
         let before = RECORDS_SKIPPED.get();
         RECORDS_SKIPPED.inc();
         assert_eq!(RECORDS_SKIPPED.get(), before + 1.0);
+    }
+
+    /// The landmine described on the `lazy_static!` block, pinned end to end against the real
+    /// encoder rather than against hand-written text.
+    ///
+    /// `writer::tests::from_text_format_rejects_the_entire_payload_when_a_histogram_is_present`
+    /// already asserts the parser's behaviour on a literal string. This is the stronger claim
+    /// and the one that matters: that a histogram *registered the ordinary way* and rendered
+    /// by the *real* `TextEncoder` destroys the whole self-metric payload, including the
+    /// healthy counter sitting next to it. Text a test author wrote by hand can be wrong about
+    /// what the encoder emits; this cannot.
+    ///
+    /// # Why a scratch `Registry` and not the global one
+    ///
+    /// Registering a histogram in the default registry would make this test *cause* the bug it
+    /// is describing, permanently, for every other test in the binary: `prometheus::gather()`
+    /// reads a process-global registry that is never torn down, so from that moment on
+    /// `self_metric_series()` returns empty and every writer test asserting on self-metrics
+    /// starts failing for reasons unrelated to itself. `Registry::new()` is isolated, and
+    /// `TextEncoder`/`from_text_format` do not care which registry produced the families.
+    #[test]
+    fn histograms_are_rejected_by_the_self_metric_text_round_trip() {
+        use prometheus::{HistogramOpts, HistogramVec, Opts, Registry};
+
+        let registry = Registry::new();
+
+        // A perfectly ordinary counter, registered first, so the assertion below is about
+        // collateral damage rather than about a payload that was empty anyway.
+        let healthy = Counter::with_opts(Opts::new("scratch_healthy_total", "a normal counter"))
+            .expect("counter opts should be valid");
+        registry
+            .register(Box::new(healthy.clone()))
+            .expect("scratch registry should accept a counter");
+        healthy.inc();
+
+        // Control: on its own, this round-trips. Without this the assertion below would also
+        // pass if `from_text_format` simply rejected everything we ever gave it.
+        let healthy_only = TextEncoder::new()
+            .encode_to_string(&registry.gather())
+            .expect("encoding a counter should succeed");
+        let parsed = WriteRequest::from_text_format(healthy_only)
+            .expect("CONTROL: a lone counter must round-trip");
+        assert_eq!(
+            parsed.timeseries.len(),
+            1,
+            "CONTROL: the healthy metric must be present before the histogram is added"
+        );
+        // Assert the *value*, not merely the series. A `Counter` that was never incremented
+        // still gathers and still renders as an explicit `0`, so `len() == 1` alone holds
+        // whether or not `inc()` above ever ran -- measured: neutralising the `inc()` left
+        // this control passing. Pinning 1.0 makes the round trip carry data, not just shape.
+        assert_eq!(
+            parsed.timeseries[0].samples[0].value, 1.0,
+            "CONTROL: the counter's value must survive the round trip"
+        );
+
+        let histogram = HistogramVec::new(
+            HistogramOpts::new("scratch_latency_seconds", "the tempting mistake"),
+            &["route"],
+        )
+        .expect("histogram opts should be valid");
+        registry
+            .register(Box::new(histogram.clone()))
+            .expect("scratch registry should accept a histogram");
+        histogram.with_label_values(&["/"]).observe(0.5);
+
+        let both = TextEncoder::new()
+            .encode_to_string(&registry.gather())
+            .expect("encoding a histogram should succeed -- the encoder is not the problem");
+        assert!(
+            both.contains("scratch_healthy_total"),
+            "the healthy counter must still be in the encoded text, got: {both}"
+        );
+
+        let err = WriteRequest::from_text_format(both)
+            .expect_err("a registered histogram must not be silently accepted");
+        assert!(
+            err.to_string().contains("histogram"),
+            "the failure must name the unsupported type, got: {err}"
+        );
+        // The point of the whole test: the counter did not survive either. One histogram
+        // takes down every self-metric in the process, not just its own family.
     }
 
     /// Seed the dimension cache so `record_metric` does not call out to AWS, and so the
