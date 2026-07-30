@@ -241,6 +241,125 @@ pub fn labels_for(metric: &CloudWatchMetric, full_metric_name: &str) -> Vec<Labe
     labels
 }
 
+/// How far outside "now" a CloudWatch timestamp may be before we drop the sample.
+///
+/// Receivers reject too-far-future samples (Mimir's `creation_grace_period` defaults to
+/// 10 minutes) and, once configured, too-old ones. Rejecting one bad sample here costs
+/// one record; letting it reach the push costs the WHOLE flush, because a single bad
+/// sample 400s the entire write request. Firehose backfill after an outage legitimately
+/// delivers hours-old records, so the past window is generous.
+const MAX_FUTURE_MS: i64 = 5 * 60 * 1000;
+const MAX_PAST_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Convert one CloudWatch record into zero or more remote-write series samples.
+///
+/// Each populated aggregate becomes its own series, suffixed `_max`/`_min`/`_sum`/`_count`.
+///
+/// `now_ms` is passed in rather than read from the clock so this module stays a total
+/// function of its arguments — no I/O, no hidden inputs, trivially testable.
+///
+/// Note `MetricUnit::Unknown` is reachable only via `Default`: the enum has no
+/// `#[serde(other)]`, so an unrecognised unit string fails deserialization of the whole
+/// record before this is called (see issue #12).
+pub fn to_series(
+    metric: &CloudWatchMetric,
+    now_ms: i64,
+) -> anyhow::Result<Vec<(Vec<Label>, Sample)>> {
+    if matches!(metric.unit, MetricUnit::Unknown) {
+        warn!(
+            "skipping record with unknown unit: {} {}",
+            metric.namespace, metric.metric_name
+        );
+        return Ok(vec![]);
+    }
+
+    // `saturating_sub`, not `-`. `timestamp` is a plain `i64` straight off the wire, so
+    // `i64::MIN` is one malformed record away: the plain subtraction panics on it in a debug
+    // build and, in release, wraps to a small age that sails through the window check — the
+    // guard delivering precisely the outcome it exists to prevent. Saturating pins both
+    // extremes outside the window, where they belong.
+    //
+    // Read the range as the two bounds it is: a negative age is a future timestamp, so the
+    // window runs from `-MAX_FUTURE_MS` (5 minutes ahead) to `MAX_PAST_MS` (24 hours behind).
+    let age = now_ms.saturating_sub(metric.timestamp);
+    if !(-MAX_FUTURE_MS..=MAX_PAST_MS).contains(&age) {
+        warn!(
+            "dropping {} {} with out-of-window timestamp {} (now {})",
+            metric.namespace, metric.metric_name, metric.timestamp, now_ms
+        );
+        return Ok(vec![]);
+    }
+
+    let base = metric_base_name(metric)?;
+
+    // Build the label set ONCE per record, not once per aggregate.
+    //
+    // The tempting argument for this — that four `labels_for` calls could disagree about
+    // which value survives a dimension-name collision — does not hold, and is worth writing
+    // down as *not* holding so nobody re-derives it as a reason to change something else.
+    // `to_labels_values` clones the map, and cloning a `HashMap` preserves iteration order,
+    // so four calls in one process agree. The survivor varies between runs, never within one.
+    //
+    // The reasons that do hold: four calls fire the dedup warning four times for one dropped
+    // dimension, which tells an operator something false about how much data was lost (pinned
+    // by `the_label_set_is_built_once_per_record_not_once_per_aggregate`), and they clone and
+    // re-sort the dimension map four times on the hot ingest path for an identical result.
+    // Building once also stops the agreement being load-bearing at all.
+    let base_labels = labels_for(metric, &base);
+
+    let mut out = Vec::new();
+
+    // Fixed order, independent of JSON field order.
+    for (suffix, value) in [
+        ("max", metric.value.max),
+        ("min", metric.value.min),
+        ("sum", metric.value.sum),
+        ("count", metric.value.count),
+    ] {
+        let Some(value) = value else { continue };
+
+        // NaN and +/-Inf survive the `as f64` widening. A specific NaN payload is
+        // Prometheus's staleness marker, so passing one through can read as "series ended".
+        if !value.is_finite() {
+            warn!("dropping non-finite {suffix} for {}", metric.metric_name);
+            continue;
+        }
+
+        // Clone the shared label set and retarget `__name__`. Do NOT assume it is at index 0.
+        //
+        // Being precise about why, because the obvious justification is currently false:
+        // nothing `label_name_for_dimension` can emit today sorts ahead of `__name__`. Every
+        // dimension-derived name starts with an ASCII lowercase letter — the ends are trimmed,
+        // so no leading `_`, and a leading digit is prefixed with `d_` — and `_` (0x5F) sorts
+        // below every lowercase letter. `labels[0]` would therefore work, by coincidence, and
+        // swapping this `find` for it kills no test.
+        //
+        // The coincidence is one edit away from ending. Before the trim existed, `!!abc`
+        // normalized to `__abc`, which does sort ahead. Under `labels[0]` that record would
+        // have had its dimension value overwritten with the metric name and been shipped with
+        // no `__name__` — silent, and not something the receiver would reject in a way that
+        // points back here. `find` costs a linear scan of five-ish labels and removes the
+        // coupling entirely. `no_dimension_derived_label_sorts_before_the_name_label` watches
+        // the precondition, since no test can watch this line directly.
+        let mut labels = base_labels.clone();
+        let name_label = labels
+            .iter_mut()
+            .find(|l| l.name == "__name__")
+            .expect("labels_for always inserts __name__");
+        name_label.value = format!("{base}_{suffix}");
+
+        out.push((
+            labels,
+            Sample {
+                value: value as f64,
+                timestamp: metric.timestamp,
+            },
+        ));
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,5 +918,326 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted);
+    }
+
+    const NOW: i64 = 1700000000000;
+
+    fn values_json(values: &str, unit: &str) -> CloudWatchMetric {
+        metric_from(&format!(
+            r#"{{"metric_stream_name":"s","account_id":"1","region":"us-east-1",
+                 "namespace":"AWS/Test","metric_name":"M","dimensions":{{}},
+                 "timestamp":1700000000000,"value":{values},"unit":"{unit}"}}"#
+        ))
+    }
+
+    fn names(series: &[(Vec<Label>, Sample)]) -> Vec<String> {
+        series
+            .iter()
+            .map(|(labels, _)| {
+                labels
+                    .iter()
+                    .find(|l| l.name == "__name__")
+                    .unwrap()
+                    .value
+                    .clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn all_four_aggregates_become_separate_series() {
+        let m = values_json(r#"{"max":1.0,"min":2.0,"sum":3.0,"count":4.0}"#, "Count");
+        let series = to_series(&m, NOW).unwrap();
+        assert_eq!(
+            names(&series),
+            vec![
+                "firehose_test_m_count_max",
+                "firehose_test_m_count_min",
+                "firehose_test_m_count_sum",
+                "firehose_test_m_count_count",
+            ]
+        );
+    }
+
+    #[test]
+    fn absent_aggregates_produce_no_series() {
+        let m = values_json(r#"{"min":2.0}"#, "Count");
+        let series = to_series(&m, NOW).unwrap();
+        assert_eq!(names(&series), vec!["firehose_test_m_count_min"]);
+    }
+
+    #[test]
+    fn sample_carries_record_timestamp_and_value() {
+        let m = values_json(r#"{"max":42.0}"#, "Count");
+        let series = to_series(&m, NOW).unwrap();
+        assert_eq!(series[0].1.timestamp, 1700000000000);
+        assert_eq!(series[0].1.value, 42.0);
+    }
+
+    #[test]
+    fn unknown_unit_produces_no_series() {
+        // `MetricUnit` has no `#[serde(other)]`, so an unrecognised unit string fails
+        // deserialization outright rather than becoming `Unknown` (issue #12).
+        // `Unknown` is only reachable via `Default`, so build it directly.
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.unit = MetricUnit::Unknown;
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_with_no_populated_aggregates_produces_no_series() {
+        let m = values_json(r#"{}"#, "Count");
+        assert!(
+            to_series(&m, NOW).unwrap().is_empty(),
+            "must yield zero series, not one with an empty sample vec"
+        );
+    }
+
+    #[test]
+    fn non_finite_values_are_dropped() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.value.max = Some(f32::NAN);
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+
+        m.value.max = Some(f32::INFINITY);
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+    }
+
+    /// `is_finite` covers the negative pole too; a `> 0.0` style check would not.
+    #[test]
+    fn negative_infinity_is_dropped() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.value.max = Some(f32::NEG_INFINITY);
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+    }
+
+    /// One bad aggregate must not take its healthy siblings with it.
+    #[test]
+    fn a_non_finite_aggregate_does_not_drop_the_others() {
+        let mut m = values_json(r#"{"max":1.0,"min":2.0}"#, "Count");
+        m.value.max = Some(f32::NAN);
+        let series = to_series(&m, NOW).unwrap();
+        assert_eq!(names(&series), vec!["firehose_test_m_count_min"]);
+        assert_eq!(series[0].1.value, 2.0);
+    }
+
+    #[test]
+    fn aggregate_order_is_stable() {
+        let m = values_json(r#"{"count":4.0,"sum":3.0,"min":2.0,"max":1.0}"#, "Count");
+        let series = to_series(&m, NOW).unwrap();
+        assert_eq!(
+            names(&series),
+            vec![
+                "firehose_test_m_count_max",
+                "firehose_test_m_count_min",
+                "firehose_test_m_count_sum",
+                "firehose_test_m_count_count",
+            ],
+            "order must not depend on JSON field order"
+        );
+    }
+
+    #[test]
+    fn timestamps_far_in_the_future_are_dropped() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.timestamp = NOW + 60 * 60 * 1000;
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn timestamps_far_in_the_past_are_dropped() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.timestamp = NOW - 48 * 60 * 60 * 1000;
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_zero_timestamp_is_dropped() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.timestamp = 0;
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+    }
+
+    /// The degenerate sibling of the two window tests above.
+    ///
+    /// `now_ms - metric.timestamp` on the extremes of `i64` overflows: in a debug build that
+    /// is a panic that takes down the request handler, and in release it wraps silently to a
+    /// small age and lets the garbage timestamp straight through the window check — the guard
+    /// producing exactly the outcome it exists to prevent. `timestamp` is an `i64` parsed
+    /// from attacker-adjacent JSON, so both extremes are one malformed record away.
+    #[test]
+    fn extreme_timestamps_are_dropped_rather_than_overflowing() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+
+        m.timestamp = i64::MIN;
+        assert!(
+            to_series(&m, NOW).unwrap().is_empty(),
+            "i64::MIN must be rejected, not overflow the age computation"
+        );
+
+        m.timestamp = i64::MAX;
+        assert!(
+            to_series(&m, NOW).unwrap().is_empty(),
+            "i64::MAX must be rejected, not overflow the age computation"
+        );
+    }
+
+    #[test]
+    fn recent_backfill_is_kept() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.timestamp = NOW - 2 * 60 * 60 * 1000;
+        assert_eq!(
+            to_series(&m, NOW).unwrap().len(),
+            1,
+            "Firehose backfill must survive"
+        );
+    }
+
+    #[test]
+    fn all_aggregates_share_one_label_set_apart_from_the_name() {
+        let m = values_json(r#"{"max":1.0,"min":2.0}"#, "Count");
+        let series = to_series(&m, NOW).unwrap();
+        let strip = |labels: &Vec<Label>| -> Vec<(String, String)> {
+            labels
+                .iter()
+                .filter(|l| l.name != "__name__")
+                .map(|l| (l.name.clone(), l.value.clone()))
+                .collect()
+        };
+        assert_eq!(strip(&series[0].0), strip(&series[1].0));
+    }
+
+    /// The `?` on `metric_base_name` must propagate, not swallow.
+    ///
+    /// Swallowing would emit a series under a malformed or defaulted name, corrupting a
+    /// series that good records write to legitimately — the exact failure the name guards in
+    /// `metric_base_name` were added to prevent. Dropping the record is the caller's call to
+    /// make, so the error has to reach it.
+    #[test]
+    fn metric_name_errors_are_propagated_not_swallowed() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.namespace = "NoSlashHere".into();
+        let err = to_series(&m, NOW).expect_err("should not build a series");
+        assert_error_names(err, "no '/' separator", "NoSlashHere");
+    }
+
+    #[test]
+    fn dimension_labels_appear_on_every_aggregate_series() {
+        let mut m = with_dims(r#"{"LoadBalancer":"app/foo"}"#);
+        m.value.min = Some(2.0);
+        let series = to_series(&m, NOW).unwrap();
+        assert_eq!(series.len(), 2);
+        for (labels, _) in &series {
+            assert!(
+                labels
+                    .iter()
+                    .any(|l| l.name == "load_balancer" && l.value == "app/foo"),
+                "got {:?}",
+                label_pairs(labels)
+            );
+        }
+        assert_eq!(
+            names(&series),
+            vec![
+                "firehose_applicationelb_requestcount_count_max",
+                "firehose_applicationelb_requestcount_count_min",
+            ]
+        );
+    }
+
+    /// The label set is built once per record, not once per aggregate.
+    ///
+    /// Four calls to `labels_for` would produce four identical results today, so no
+    /// assertion on the *labels* can tell the two apart. The observable difference is the
+    /// dedup warning: one collision in one record must leave one line in the log, not four.
+    /// That is worth pinning on its own terms — an operator reading four warnings for one
+    /// dropped dimension is being told something false about how much data was lost.
+    #[test]
+    fn the_label_set_is_built_once_per_record_not_once_per_aggregate() {
+        log_sink();
+        // Values unique to this test: the log buffer is shared with every other test.
+        let mut m = with_dims(r#"{"InstanceId":"per-record-aa","instance_id":"per-record-bb"}"#);
+        m.value.min = Some(2.0);
+        m.value.sum = Some(3.0);
+        m.value.count = Some(4.0);
+        assert_eq!(to_series(&m, NOW).unwrap().len(), 4);
+
+        let lines = captured_logs()
+            .lines()
+            .filter(|l| l.contains("per-record-"))
+            .count();
+        assert_eq!(
+            lines, 1,
+            "one collision in one record must warn once, not once per aggregate"
+        );
+    }
+
+    /// Hostile dimension names must survive the whole conversion, not just `labels_for`.
+    ///
+    /// Today these normalize to ordinary names and this test is unremarkable. Its second job
+    /// is as a tripwire: these are the inputs that would lead the sorted label set if the trim
+    /// in `label_name_for_dimension` were ever loosened (`!!abc` used to become `__abc`, which
+    /// sorts ahead of `__name__`). Paired with `to_series` locating `__name__` by name, that
+    /// makes the pair of changes needed to corrupt a metric name fail here rather than ship.
+    #[test]
+    fn hostile_dimension_names_survive_the_whole_conversion() {
+        let mut m = with_dims(r#"{"!!abc":"v","//replica//":"w"}"#);
+        m.value.min = Some(2.0);
+        let series = to_series(&m, NOW).unwrap();
+        assert_eq!(
+            names(&series),
+            vec![
+                "firehose_applicationelb_requestcount_count_max",
+                "firehose_applicationelb_requestcount_count_min",
+            ]
+        );
+        for (labels, _) in &series {
+            assert!(
+                labels.iter().any(|l| l.name == "abc" && l.value == "v"),
+                "got {:?}",
+                label_pairs(labels)
+            );
+            assert!(
+                labels.iter().any(|l| l.name == "replica" && l.value == "w"),
+                "got {:?}",
+                label_pairs(labels)
+            );
+        }
+    }
+
+    /// Pins the precondition that an index shortcut in `to_series` would silently depend on.
+    ///
+    /// `to_series` finds `__name__` by name rather than at index 0. Nothing today produces a
+    /// label sorting ahead of it — every dimension-derived name starts with an ASCII letter,
+    /// since `label_name_for_dimension` trims the ends and prefixes a leading digit, and `_`
+    /// (0x5F) sorts below every lowercase letter. So `labels[0]` would work *by coincidence*,
+    /// and swapping the `find` for it kills no test.
+    ///
+    /// This test watches the coincidence instead of the shortcut. Loosen the normalizer — drop
+    /// the trim, stop prefixing leading digits — and a dimension can lead the sorted set; a
+    /// `labels[0]` implementation would then overwrite that dimension's value with the metric
+    /// name and emit the series unnamed. Failing here is the warning that the shortcut has
+    /// become unsafe.
+    #[test]
+    fn no_dimension_derived_label_sorts_before_the_name_label() {
+        for input in [
+            "!!abc",
+            "//replica//",
+            "5xxCode",
+            "__name__",
+            "AccountId",
+            "_leading",
+            "0",
+            "...",
+            "Some-Weird.Name",
+        ] {
+            let Some(name) = label_name_for_dimension(input) else {
+                continue;
+            };
+            assert!(
+                name.as_str() > "__name__",
+                "{input:?} normalized to {name:?}, which sorts ahead of `__name__`"
+            );
+        }
     }
 }
