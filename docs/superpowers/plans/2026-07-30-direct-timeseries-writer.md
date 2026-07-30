@@ -14,6 +14,37 @@
 
 ## Critical context
 
+### Mutation testing: how to not fool yourself
+
+Every task in this plan requires mutation-checking each guard. Two rules learned the hard
+way during Tasks 1-5:
+
+1. **A surviving mutant means nothing is watching it. It NEVER means the case is
+   unreachable.** That inference was made once here and was wrong: mutant M3a survived,
+   was declared "provably unreachable", and `!!name!!` was later found to reach it.
+
+2. **Prove the harness actually mutates.** A shell helper silently dropped its arguments
+   during Task 5 and reported eight surviving mutants without ever applying one. Assert
+   the pattern was found and replaced, and include at least one CONTROL mutation known to
+   kill tests in the same run. Kills are self-verifying -- an unmutated build cannot fail
+   -- so only survivals need this corroboration.
+
+3. **Check whether a kill is probabilistic.** A 3-sample ordering test killed a
+   `BTreeMap`->`HashMap` mutant only 19 times in 25 runs, because `HashMap` iteration
+   comes out sorted by luck roughly 1 time in 6. Re-run suspicious kills several times;
+   a regression caught 3 times in 4 reaches production.
+
+### Test log capture
+
+`src/testlog.rs` owns the single process-wide `tracing` subscriber slot. Use
+`captured_logs()` to assert on `warn!`/`error!` output. Do NOT install another subscriber
+anywhere -- `set_global_default` returns `Err` on the second call and the panic will land
+far from its cause, flakily, depending on which module's tests run first.
+
+An unwatched `warn!` rots: it can be deleted, corrupted, or made to fire spuriously on
+every startup without a single test noticing.
+
+
 **The `firehose_` prefix is now yours to add.** Today `app_opts!` calls
 `.namespace(PROM_NAMESPACE)`, and the prometheus crate builds `fq_name = "{namespace}_{name}"`.
 That is why the current metric is `firehose_test_happypath_count_max`. Once we build `Label`s
