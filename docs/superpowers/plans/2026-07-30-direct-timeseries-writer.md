@@ -239,13 +239,21 @@ use convert_case::{Case, Casing};
 /// Reserved label names we set ourselves. A dimension normalizing onto any of these
 /// would overwrite our own label, so collisions are prefixed instead.
 ///
-/// Reachability differs per entry, verified by mutation testing:
+/// The value of an entry here is DATA PRESERVATION, not protecting our own label: our
+/// labels are inserted first and stable sort makes them the dedup survivor anyway.
+/// Without the prefix, a colliding dimension's value is silently discarded.
+///
+/// Reachability per entry:
 /// - `metric_stream_name`, `account_id`: reachable from a real dimension name.
 /// - `region`: unreachable via `labels_for` because `to_labels_values()` pre-maps it,
 ///   but reachable when calling this function directly, so it is pinned by a unit test.
-/// - `__name__`: provably unreachable — `to_case(Case::Snake)` strips leading and
-///   trailing underscores, so no input can clean to it. Kept as defence-in-depth
-///   against a future change to the normalization, not as live protection.
+/// - `__name__`: unreachable ONLY because normalization trims leading/trailing `_`.
+///   Do not weaken that trim without restoring live protection here. Before the trim
+///   existed, `!!name!!` reached `__name__` — `to_case` strips underscores but NOT
+///   punctuation, which becomes `_` in the later mapping step.
+///
+/// A mutant that kills zero tests means nothing is watching the entry. It does NOT
+/// mean the entry is unreachable — that inference was made once here and was wrong.
 const RESERVED_LABELS: [&str; 4] = ["__name__", "metric_stream_name", "account_id", "region"];
 
 /// Normalize a CloudWatch dimension name into a valid Prometheus label name.
@@ -522,17 +530,55 @@ Expected: FAIL to compile — `cannot find function to_series in this scope`.
 Add to `src/series.rs`:
 
 ```rust
+/// How far outside "now" a CloudWatch timestamp may be before we drop the sample.
+///
+/// Receivers reject too-far-future samples (Mimir's `creation_grace_period` defaults to
+/// 10 minutes) and, once configured, too-old ones. Rejecting one bad sample here costs
+/// one record; letting it reach the push costs the WHOLE flush, because a single bad
+/// sample 400s the entire write request. Firehose backfill after an outage legitimately
+/// delivers hours-old records, so the past window is generous.
+const MAX_FUTURE_MS: i64 = 5 * 60 * 1000;
+const MAX_PAST_MS: i64 = 24 * 60 * 60 * 1000;
+
 /// Convert one CloudWatch record into zero or more remote-write series samples.
 ///
 /// Each populated aggregate becomes its own series, suffixed `_max`/`_min`/`_sum`/`_count`.
-/// A record with an unrecognised unit deserializes to `MetricUnit::Unknown` and is skipped.
-pub fn to_series(metric: &CloudWatchMetric) -> anyhow::Result<Vec<(Vec<Label>, Sample)>> {
+///
+/// `now_ms` is passed in rather than read from the clock so this module stays a total
+/// function of its arguments — no I/O, no hidden inputs, trivially testable.
+///
+/// Note `MetricUnit::Unknown` is reachable only via `Default`: the enum has no
+/// `#[serde(other)]`, so an unrecognised unit string fails deserialization of the whole
+/// record before this is called (see issue #12).
+pub fn to_series(
+    metric: &CloudWatchMetric,
+    now_ms: i64,
+) -> anyhow::Result<Vec<(Vec<Label>, Sample)>> {
     if matches!(metric.unit, MetricUnit::Unknown) {
         warn!("skipping record with unknown unit: {} {}", metric.namespace, metric.metric_name);
         return Ok(vec![]);
     }
 
+    let age = now_ms - metric.timestamp;
+    if age < -MAX_FUTURE_MS || age > MAX_PAST_MS {
+        warn!(
+            "dropping {} {} with out-of-window timestamp {} (now {})",
+            metric.namespace, metric.metric_name, metric.timestamp, now_ms
+        );
+        return Ok(vec![]);
+    }
+
     let base = metric_base_name(metric)?;
+
+    // Build the label set ONCE per record, not once per aggregate. Calling `labels_for`
+    // four times would re-run dedup four times, and which value survives a dimension-name
+    // collision depends on `HashMap` iteration order — four calls agreeing is an accident,
+    // not a guarantee. If it ever stopped holding, `_max` would carry one value and `_min`
+    // another, silently splitting one metric across two series with no error anywhere.
+    // It also fires the dedup warning 4x per record and clones the dimension map 4x on the
+    // hot ingest path.
+    let base_labels = labels_for(metric, &base);
+
     let mut out = Vec::new();
 
     // Fixed order, independent of JSON field order.
@@ -551,15 +597,77 @@ pub fn to_series(metric: &CloudWatchMetric) -> anyhow::Result<Vec<(Vec<Label>, S
             continue;
         }
 
-        let full_name = format!("{base}_{suffix}");
+        // Clone the shared label set and retarget `__name__`. Do NOT assume it is at
+        // index 0 — labels are sorted by name, and a dimension normalizing to something
+        // like `__abc` would sort ahead of it.
+        let mut labels = base_labels.clone();
+        let name_label = labels
+            .iter_mut()
+            .find(|l| l.name == "__name__")
+            .expect("labels_for always inserts __name__");
+        name_label.value = format!("{base}_{suffix}");
+
         out.push((
-            labels_for(metric, &full_name),
+            labels,
             Sample { value: value as f64, timestamp: metric.timestamp },
         ));
     }
 
     Ok(out)
 }
+```
+
+**Error propagation — important for Task 10.** `to_series` is fallible only for
+per-record, non-retryable conditions (an unusable namespace or metric name). The handler
+must log-and-skip, never `?` out of the request: returning non-2xx makes Firehose replay
+the whole batch, and one permanently-malformed record becomes an infinite poison-pill
+loop. The legacy handler already gets this right at src/main.rs:126-131. Task 10 counts
+these as `self_records_skipped_count`.
+
+**Add these tests** for the timestamp window and the shared label set:
+
+```rust
+    const NOW: i64 = 1700000000000;
+
+    #[test]
+    fn timestamps_far_in_the_future_are_dropped() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.timestamp = NOW + 60 * 60 * 1000;
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn timestamps_far_in_the_past_are_dropped() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.timestamp = NOW - 48 * 60 * 60 * 1000;
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_zero_timestamp_is_dropped() {
+        // `CloudWatchMetric` derives Default, and serde accepts 0 without complaint.
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.timestamp = 0;
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recent_backfill_is_kept() {
+        let mut m = values_json(r#"{"max":1.0}"#, "Count");
+        m.timestamp = NOW - 2 * 60 * 60 * 1000;
+        assert_eq!(to_series(&m, NOW).unwrap().len(), 1, "Firehose backfill must survive");
+    }
+
+    #[test]
+    fn all_aggregates_share_one_label_set_apart_from_the_name() {
+        let m = values_json(r#"{"max":1.0,"min":2.0}"#, "Count");
+        let series = to_series(&m, NOW).unwrap();
+        let strip = |labels: &Vec<Label>| -> Vec<(String, String)> {
+            labels.iter().filter(|l| l.name != "__name__")
+                .map(|l| (l.name.clone(), l.value.clone())).collect()
+        };
+        assert_eq!(strip(&series[0].0), strip(&series[1].0));
+    }
 ```
 
 **Note on `f32` → `f64` widening:** `1.1f32 as f64` is `1.100000023841858`. The legacy path
