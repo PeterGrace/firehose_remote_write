@@ -1,8 +1,11 @@
+use crate::config::Config;
+use crate::prometheus::{BATCHES_DROPPED, BUFFER_SERIES, FLUSH_DURATION};
 use prometheus::TextEncoder;
 use prometheus_remote_write::{Label, Sample, TimeSeries, WriteRequest};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::time::Duration;
+use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 
 /// Buffers samples between flushes.
@@ -285,12 +288,158 @@ where
     PushOutcome::Dropped
 }
 
+/// One handler's worth of samples, already converted to series identity.
+pub type SeriesBatch = Vec<(Vec<Label>, Sample)>;
+
+/// Own the accumulator and be the only thing that ever pushes.
+///
+/// Generic over the send closure so tests can drive it without an HTTP stack.
+/// Exits when the channel closes, flushing anything still buffered.
+///
+/// # This task is deliberately a serialization point, and that is the backpressure
+///
+/// `flush` is `await`ed from inside the `select!` body, so while a push is in flight — up to
+/// [`MAX_TOTAL_RETRY_TIME`] with retries — nothing is draining `rx`. The channel fills, the
+/// handler starts rejecting payloads, and Firehose retries the delivery. That is the intended
+/// design, not an oversight: the alternative is to keep accepting records into a buffer that
+/// grows for as long as the remote is down, which converts a recoverable downstream outage
+/// into an unrecoverable OOM, and loses *everything* buffered instead of pushing the loss
+/// back to an upstream that is built to redeliver. Nothing queued during a stall is lost —
+/// it is still in the channel when the writer returns to the loop, and it carries its own
+/// CloudWatch timestamps, so a late flush is late data rather than wrong data.
+///
+/// `nothing_drains_the_channel_while_a_push_is_in_flight` pins this so that a future change
+/// making the push concurrent has to argue with a test rather than slip through.
+pub async fn run_writer<F, Fut>(mut rx: Receiver<SeriesBatch>, config: Config, mut send: F)
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: Future<Output = anyhow::Result<u16>>,
+{
+    let mut acc = Accumulator::new();
+    let period = Duration::from_secs(config.flush_interval_secs);
+
+    // `interval_at(now + period, ...)`, NOT `interval(period)`. `tokio::time::interval`
+    // completes its first tick immediately, and that tick is not consumed until a `select!`
+    // arm actually wins it — so the ticker branch stays ready across *every* iteration until
+    // it does. With both arms ready, `select!` picks at random.
+    //
+    // For correctness that is harmless: `flush` returns early when the accumulator is empty.
+    // For *observability* it is fatal, and this was measured rather than estimated. The
+    // random pick only matters while both arms are ready; `rx.recv()` eventually goes
+    // pending, at which point the still-unconsumed tick-0 is the only ready arm and wins
+    // unconditionally. So with `interval` the writer performs one flush of whatever is
+    // buffered *no matter what the threshold says*, and deleting the series-threshold check
+    // left `writer_flushes_when_series_threshold_is_reached` passing 25 runs out of 25. Not
+    // a flaky detector — no detector at all. (With `interval_at`: killed 25 out of 25.)
+    //
+    // Skipping the immediate tick changes nothing else: `interval` fires at 0 and then at
+    // `period`, and the tick at 0 has nothing to flush.
+    let mut ticker = tokio::time::interval_at(Instant::now() + period, period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        let should_flush = tokio::select! {
+            received = rx.recv() => match received {
+                Some(batch) => {
+                    for (labels, sample) in batch {
+                        acc.insert(labels, sample);
+                    }
+                    BUFFER_SERIES.set(acc.series_count() as f64);
+                    acc.series_count() >= config.flush_max_series
+                }
+                // Channel closed: flush what is left, then stop.
+                None => {
+                    if !acc.is_empty() {
+                        // The final flush is the one nobody is watching -- it happens while
+                        // the process is on its way out, and a failure here loses the tail of
+                        // the data with no next flush to carry it. Say what is at stake
+                        // before attempting it, so the drop that may follow has a size.
+                        warn!(
+                            "channel closed; flushing {} buffered series before exit",
+                            acc.series_count()
+                        );
+                    }
+                    flush(&mut acc, &config, &mut send).await;
+                    return;
+                }
+            },
+            _ = ticker.tick() => true,
+        };
+
+        if should_flush {
+            flush(&mut acc, &config, &mut send).await;
+        }
+    }
+}
+
+/// Drain the accumulator into one request and push it, or account for losing it.
+///
+/// # A dropped batch is gone
+///
+/// `acc.drain()` empties the accumulator before the push, so on [`PushOutcome::Dropped`] the
+/// samples do not exist anywhere. That is the intended trade — bounded retry, then drop, so
+/// one unreachable remote cannot stall the pipeline behind it — but it means the *only*
+/// record of the loss is what is written here and in `push_with_retry`. `BATCHES_DROPPED`
+/// alone answers "did we lose data" and not "how much", which is the first question anyone
+/// asks; the `error!` supplies the series count so the two together are enough to size an
+/// incident from the logs of a single replica.
+///
+/// # One mutant survives here, knowingly
+///
+/// Deleting the `BATCHES_DROPPED.inc()` in the *encode* arm (or its `error!`) kills no test,
+/// and as with [`self_metric_series`] that is a statement about reachability from inside this
+/// process, not a claim that the branch does not matter. `encode_compressed` is
+/// `prost::encode_to_vec` followed by `snap::raw::Encoder::compress_vec`, and snappy's only
+/// failure is `Error::TooBig`, raised when the input exceeds `MAX_INPUT_SIZE` — `u32::MAX`,
+/// four gigabytes of encoded protobuf in a single flush. Reaching it in a test means building
+/// that payload. The arm is kept, and written to account for the loss the same way the push
+/// arm does, so that a future change to the encoding does not find an unhandled `Result`.
+///
+/// Note that the accumulator is *already drained* by the time this can fire, so this arm is a
+/// real data-loss path and not merely a skipped push — which is why it counts the batch.
+async fn flush<F, Fut>(acc: &mut Accumulator, config: &Config, send: &mut F)
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: Future<Output = anyhow::Result<u16>>,
+{
+    if acc.is_empty() {
+        return;
+    }
+
+    let started = tokio::time::Instant::now();
+    let series_count = acc.series_count();
+    let request = build_request(acc.drain(), self_metric_series());
+
+    let body = match request.encode_compressed() {
+        Ok(b) => b,
+        Err(e) => {
+            error!("could not encode write request: {e}");
+            BATCHES_DROPPED.inc();
+            return;
+        }
+    };
+
+    // `&mut F` implements `FnMut` when `F: FnMut`, so reborrowing satisfies
+    // `push_with_retry`'s by-value parameter without giving up ownership of `send`.
+    if push_with_retry(body, config.push_max_attempts, &mut *send).await == PushOutcome::Dropped {
+        error!("dropped a batch of {series_count} series after exhausting the push policy");
+        BATCHES_DROPPED.inc();
+    }
+
+    // Sound because this task is the only writer of `acc` and it is inside `flush`: no batch
+    // can have been accumulated during the push. Anything that arrived is still in the
+    // channel, uncounted, and will set this again on the next receive.
+    BUFFER_SERIES.set(0.0);
+    FLUSH_DURATION.set(started.elapsed().as_secs_f64());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testlog::LogTail;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     fn labels(name: &str) -> Vec<Label> {
         vec![Label {
@@ -1369,5 +1518,579 @@ mod tests {
                 "a clean push must not log {phrase:?}, got: {logs}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // run_writer
+    //
+    // # Every test here holds a `LogTail`, and it is the isolation, not just the capture
+    //
+    // `run_writer` writes `BUFFER_SERIES`, `FLUSH_DURATION` and `BATCHES_DROPPED`, which are
+    // plain (non-`Vec`) self-metrics with a const `instance` label and therefore *one*
+    // process-wide value each — there is no dimension to isolate a test on. Two writer tests
+    // running concurrently would race on them, and so would
+    // `prometheus::tests::every_self_metric_registers_with_the_instance_const_label`, which
+    // asserts `BUFFER_SERIES.get() == 3.0` on the same static.
+    //
+    // `prometheus.rs` solved its version of this by consolidating every write into a single
+    // test. That does not generalise here: the writer's self-metric updates are spread across
+    // the flush path and the receive path, and folding six behaviours into one test would
+    // make the failures unreadable. The `LogTail` lock is a strictly better fit — it is
+    // already process-wide, it is already held by the `prometheus.rs` test that reads these
+    // statics, and rule "every test in a module that logs must hold it" independently
+    // requires it here, since `run_writer` logs on the drop and shutdown paths.
+    //
+    // Bind it to a named `_log`. `let _ = LogTail::start()` drops the guard immediately.
+    // ---------------------------------------------------------------------------------
+
+    /// What [`flush_spy`] hands back, named so the return type stays readable.
+    ///
+    /// `std::future::Ready` rather than an `async move` block because an `async` block's type
+    /// is unnameable, and `run_writer`'s `Fut` parameter needs a concrete one for the closure
+    /// to be returned from a function at all.
+    trait SpySend: FnMut(Vec<u8>) -> std::future::Ready<anyhow::Result<u16>> {}
+    impl<T: FnMut(Vec<u8>) -> std::future::Ready<anyhow::Result<u16>>> SpySend for T {}
+
+    /// Observe flushes without a wall clock.
+    ///
+    /// The writer hands each pushed body to an unbounded channel and the test awaits it.
+    /// This replaces the "poll a counter every 10ms until it moves" shape, which is a
+    /// probabilistic detector: it reports a pass whenever the flush happens *at all* within
+    /// the timeout, so it cannot distinguish "flushed for the reason under test" from
+    /// "flushed for some other reason, slowly".
+    ///
+    /// `std::future::ready` rather than an `async move` block so the closure has a nameable
+    /// return type and can be handed back from a function.
+    fn flush_spy(status: u16) -> (impl SpySend, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let send = move |body: Vec<u8>| {
+            // Ignore a closed receiver rather than panicking inside the writer task: a test
+            // that has finished asserting should not turn into a panic in a detached task.
+            let _ = tx.send(body);
+            std::future::ready(Ok(status))
+        };
+        (send, rx)
+    }
+
+    fn batch(name: &str, timestamp: i64) -> SeriesBatch {
+        vec![(
+            labels(name),
+            Sample {
+                value: 1.0,
+                timestamp,
+            },
+        )]
+    }
+
+    /// A sound synchronisation point under `start_paused`, and the reason these tests do not
+    /// need retries or generous windows.
+    ///
+    /// Tokio only auto-advances the virtual clock when **every** task is idle. `run_writer`
+    /// is idle exactly when its `rx.recv()` is pending, which is exactly when the channel is
+    /// empty — so a `sleep` that returns proves the writer has already consumed and processed
+    /// every batch sent before it. That is a guarantee, not a probability, which is what
+    /// separates this from `sleep(Duration::from_millis(10))` on a real clock.
+    async fn let_the_writer_catch_up() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    /// Await something that must happen, and *fail* rather than hang if it does not.
+    ///
+    /// Under `start_paused` a test whose only remaining work is a never-ready future has no
+    /// timer to advance to, so it blocks forever rather than finishing. Several of the
+    /// mutations these tests exist to catch — removing the ticker arm, removing the shutdown
+    /// return — produce exactly that, and a hung CI job is a much worse signal than a failed
+    /// one: it reports nothing, it reports it slowly, and it usually gets retried. The bound
+    /// is sixty *virtual* seconds, so it costs a healthy test nothing.
+    async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
+        match tokio::time::timeout(Duration::from_secs(60), fut).await {
+            Ok(value) => value,
+            Err(_) => panic!("timed out waiting for {what}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_flushes_when_series_threshold_is_reached() {
+        let _log = LogTail::start();
+        let (tx, rx) = mpsc::channel(16);
+        let flushed = Arc::new(AtomicUsize::new(0));
+        let f = flushed.clone();
+
+        let config = crate::config::Config::from_values(Some("3600"), Some("2"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, move |body| {
+            let f = f.clone();
+            async move {
+                assert!(!body.is_empty(), "flush should never push an empty body");
+                f.fetch_add(1, Ordering::SeqCst);
+                Ok(200u16)
+            }
+        }));
+
+        tx.send(vec![(
+            labels("a"),
+            Sample {
+                value: 1.0,
+                timestamp: 1,
+            },
+        )])
+        .await
+        .unwrap();
+        tx.send(vec![(
+            labels("b"),
+            Sample {
+                value: 1.0,
+                timestamp: 1,
+            },
+        )])
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while flushed.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("writer should flush once the series threshold is reached");
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_flushes_remaining_series_on_shutdown() {
+        let _log = LogTail::start();
+        let (tx, rx) = mpsc::channel(16);
+        let flushed = Arc::new(AtomicUsize::new(0));
+        let f = flushed.clone();
+
+        // Huge interval and threshold: only the shutdown path can flush this.
+        let config =
+            crate::config::Config::from_values(Some("3600"), Some("100000"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, move |_body| {
+            let f = f.clone();
+            async move {
+                f.fetch_add(1, Ordering::SeqCst);
+                Ok(200u16)
+            }
+        }));
+
+        tx.send(vec![(
+            labels("a"),
+            Sample {
+                value: 1.0,
+                timestamp: 1,
+            },
+        )])
+        .await
+        .unwrap();
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+
+        assert_eq!(
+            flushed.load(Ordering::SeqCst),
+            1,
+            "pending series must not be lost on shutdown"
+        );
+    }
+
+    /// The ticker arm, on its own. The threshold is set out of reach, so the *only* thing
+    /// that can push here is the interval — and the assertion is on the exact virtual instant
+    /// it fires, not merely that it did. Under `start_paused` tokio advances the clock to the
+    /// next deadline and no further, so `elapsed() == 1s` distinguishes "the interval flushed
+    /// it" from "something else flushed it and the interval was never involved".
+    #[tokio::test(start_paused = true)]
+    async fn the_interval_flushes_on_its_own_when_the_threshold_is_out_of_reach() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values(Some("1"), Some("100000"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, send));
+
+        tx.send(batch("a", 1)).await.unwrap();
+
+        let started = Instant::now();
+        let body = within("the interval flush", flushes.recv())
+            .await
+            .expect("the interval must flush without help from the threshold");
+        assert!(!body.is_empty());
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(1),
+            "flushed off-schedule: the interval arm is not what pushed this"
+        );
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+    }
+
+    /// The test above states the ticker's schedule; this one is the net that actually holds
+    /// it, and the difference is measured.
+    ///
+    /// `tokio::select!` picks at random among branches that are *simultaneously* ready, and
+    /// `tokio::time::interval`'s first tick is ready from the moment the writer starts and
+    /// stays ready until an arm wins it. So whether a buffered batch gets flushed immediately
+    /// or one full interval later comes down to a coin flip in the first loop iteration:
+    /// swapping `interval_at` back to `interval` was measured killing the single-trial test
+    /// **14 runs in 25**. A regression CI catches half the time is not caught.
+    ///
+    /// Twelve independent trials put a surviving mutant at 2^-12, which makes this a
+    /// deterministic guard in practice. Keep both tests: the one above reads as the
+    /// specification of the interval, this one is what enforces it. (Same reasoning, and the
+    /// same shape, as `ordering_holds_for_enough_samples_that_luck_cannot_explain_it`.)
+    #[tokio::test(start_paused = true)]
+    async fn a_buffered_batch_is_never_flushed_before_the_first_interval_elapses() {
+        let _log = LogTail::start();
+        for trial in 0..12 {
+            let (send, mut flushes) = flush_spy(200);
+            let (tx, rx) = mpsc::channel(16);
+            let config = Config::from_values(Some("1"), Some("100000"), None, Some("1"));
+            let handle = tokio::spawn(run_writer(rx, config, send));
+
+            tx.send(batch("a", 1)).await.unwrap();
+            // The writer has not been polled yet -- `send` on a channel with a free slot
+            // completes without yielding -- so it builds its ticker at this same instant.
+            let started = Instant::now();
+            within("a flush", flushes.recv())
+                .await
+                .expect("the interval must flush the batch");
+            assert_eq!(
+                started.elapsed(),
+                Duration::from_secs(1),
+                "trial {trial}: flushed off-schedule; a first tick that is ready immediately \
+                 flushes whatever happens to be buffered, whenever it happens to win the select"
+            );
+
+            drop(tx);
+            within("the writer to exit", handle).await.unwrap();
+        }
+    }
+
+    /// The `is_empty` early return, and the strongest form of the assertion: not "the body
+    /// was non-empty" but "nothing was sent at all".
+    ///
+    /// `!body.is_empty()` is a weak guard here and it is worth saying why, because the given
+    /// threshold test uses it. A flush with an empty accumulator still calls
+    /// `self_metric_series()`, and the self-metrics are never empty — so removing the early
+    /// return produces a perfectly non-empty body containing nothing but this process's own
+    /// counters, ten times a second, forever. Only "no push happened" catches that.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_writer_never_pushes_at_all() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values(Some("1"), Some("100000"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, send));
+
+        // Ten flush intervals with nothing buffered.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(
+            flushes.try_recv().is_err(),
+            "an idle tick must not push a self-metrics-only body"
+        );
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+        assert!(
+            flushes.try_recv().is_err(),
+            "shutdown with nothing buffered must not push either"
+        );
+    }
+
+    /// The threshold is a `>=` on a count, so it has two ways to be wrong and this watches
+    /// the other one: `writer_flushes_when_series_threshold_is_reached` catches a threshold
+    /// that never fires, this catches one that fires too early (an off-by-one, a `>` that
+    /// became `>=` on the wrong side, or a check deleted in favour of flushing every batch).
+    ///
+    /// The timeout is 60 virtual seconds against a 3600-second interval, so a threshold that
+    /// never fires ends this promptly with a clear failure rather than hanging: with no other
+    /// timer to advance to, tokio jumps to the timeout and it expires.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_under_the_threshold_does_not_flush() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values(Some("3600"), Some("3"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, send));
+
+        tx.send(batch("a", 1)).await.unwrap();
+        tx.send(batch("b", 1)).await.unwrap();
+        let_the_writer_catch_up().await;
+        assert!(
+            flushes.try_recv().is_err(),
+            "two series must not trip a threshold of three"
+        );
+
+        tx.send(batch("c", 1)).await.unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(60), flushes.recv())
+            .await
+            .expect("the third series must trip the threshold")
+            .expect("writer should still be running");
+        assert!(!body.is_empty());
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+    }
+
+    /// Every self-metric the writer touches, in one test.
+    ///
+    /// Consolidated deliberately: these are plain (non-`Vec`) statics with a const `instance`
+    /// label, so each has exactly one process-wide value and no dimension to isolate on.
+    /// Splitting this into "one test per gauge" would have them racing each other on the same
+    /// two floats. The `LogTail` lock keeps them away from `prometheus.rs`'s reader of the
+    /// same statics; keeping them in one test keeps them away from each other.
+    ///
+    /// `FLUSH_DURATION` is asserted against a *virtual* two-second push, which is why the send
+    /// closure sleeps instead of returning `ready`: with an instant push the gauge would read
+    /// 0.0 and an assertion of `>= 0.0` would be satisfied by a gauge that is never set at all.
+    #[tokio::test(start_paused = true)]
+    async fn the_writer_reports_its_buffer_depth_and_flush_duration() {
+        let _log = LogTail::start();
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values(Some("3600"), Some("3"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, |_body| async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(200u16)
+        }));
+
+        tx.send(batch("a", 1)).await.unwrap();
+        tx.send(batch("b", 1)).await.unwrap();
+        let_the_writer_catch_up().await;
+        assert_eq!(
+            BUFFER_SERIES.get(),
+            2.0,
+            "buffer depth must track what is actually accumulated"
+        );
+
+        // Trips the threshold of three, so the flush runs and the two-second push completes.
+        tx.send(batch("c", 1)).await.unwrap();
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+
+        assert_eq!(
+            BUFFER_SERIES.get(),
+            0.0,
+            "the buffer must read empty once it has been drained and pushed"
+        );
+        assert_eq!(
+            FLUSH_DURATION.get(),
+            2.0,
+            "flush duration must measure the push, not the bookkeeping around it"
+        );
+    }
+
+    /// A dropped batch must be both counted and *sized*. `BATCHES_DROPPED` answers "did we
+    /// lose data"; on its own it cannot answer "how much", which is the first question asked
+    /// during an incident and the one that decides whether anyone needs to be woken up.
+    /// The series count in the log is the only place that number exists — `acc.drain()` has
+    /// already destroyed the evidence by the time the push fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_batch_is_counted_and_its_size_is_logged() {
+        let tail = LogTail::start();
+        let before = BATCHES_DROPPED.get();
+        let (tx, rx) = mpsc::channel(16);
+        // Threshold of one, a single attempt, and a permanent 503: exactly one dropped batch.
+        let config = Config::from_values(Some("3600"), Some("1"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, |_body| {
+            std::future::ready(Ok(503u16))
+        }));
+
+        tx.send(batch("only-series", 1)).await.unwrap();
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+
+        let logs = tail.tail();
+        assert_eq!(
+            BATCHES_DROPPED.get(),
+            before + 1.0,
+            "an abandoned batch must be counted exactly once"
+        );
+        assert!(
+            logs.contains("dropped a batch of 1 series"),
+            "the drop must say how much was lost, got: {logs}"
+        );
+    }
+
+    /// A successful flush must not touch the drop counter. Without this, incrementing
+    /// `BATCHES_DROPPED` unconditionally — or on the wrong side of the comparison — would go
+    /// unnoticed by the test above, which only ever asserts that the counter *did* move.
+    #[tokio::test(start_paused = true)]
+    async fn a_delivered_batch_is_not_counted_as_dropped() {
+        let _log = LogTail::start();
+        let before = BATCHES_DROPPED.get();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values(Some("3600"), Some("1"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, send));
+
+        tx.send(batch("delivered", 1)).await.unwrap();
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+
+        assert!(
+            flushes.try_recv().is_ok(),
+            "the batch should have been sent"
+        );
+        assert_eq!(
+            BATCHES_DROPPED.get(),
+            before,
+            "a 200 must not increment the drop counter"
+        );
+    }
+
+    /// The shutdown drain must announce itself. It is the one flush with no next flush behind
+    /// it: a failure here loses the tail of the data permanently, and it happens while the
+    /// process is exiting and least likely to be watched. `writer_flushes_remaining_series_on
+    /// _shutdown` proves the flush happens; this proves it is attributable afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_drain_says_how_much_it_is_flushing() {
+        let tail = LogTail::start();
+        let (send, _flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values(Some("3600"), Some("100000"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, send));
+
+        tx.send(batch("a", 1)).await.unwrap();
+        tx.send(batch("b", 1)).await.unwrap();
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+
+        let logs = tail.tail();
+        assert!(
+            logs.contains("channel closed; flushing 2 buffered series before exit"),
+            "the final drain must name what it is carrying out, got: {logs}"
+        );
+    }
+
+    /// ...and must stay quiet when there is nothing to carry out. A line on every clean
+    /// shutdown is the kind of noise that trains operators to skip the one that matters.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_shutdown_drain_is_silent() {
+        let tail = LogTail::start();
+        let (send, _flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel::<SeriesBatch>(16);
+        let config = Config::from_values(Some("3600"), Some("100000"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, send));
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+
+        let logs = tail.tail();
+        assert!(
+            !logs.contains("channel closed"),
+            "an empty shutdown must not announce a drain, got: {logs}"
+        );
+    }
+
+    /// The backpressure design, pinned.
+    ///
+    /// `flush` is awaited from inside the `select!` body, so a push in flight stops the writer
+    /// draining `rx` entirely. That is intentional — see [`run_writer`] — and it is the kind
+    /// of property that a well-meaning refactor ("why are we blocking the loop on I/O?")
+    /// removes without noticing, trading a bounded channel and a 503 back to Firehose for an
+    /// unbounded in-memory buffer that grows for the whole duration of a remote outage.
+    ///
+    /// Making the push concurrent would make this test fail, which is the point.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_drains_the_channel_while_a_push_is_in_flight() {
+        let _log = LogTail::start();
+        // Capacity two, so "the channel is full" is reached by two sends rather than by
+        // guessing at a default.
+        let (tx, rx) = mpsc::channel(2);
+        let config = Config::from_values(Some("3600"), Some("1"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, |_body| async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(200u16)
+        }));
+
+        // Threshold of one: the writer takes this batch and goes straight into a ten-second
+        // push, leaving the channel unattended.
+        tx.send(batch("a", 1)).await.unwrap();
+        let_the_writer_catch_up().await;
+
+        tx.try_send(batch("b", 1)).expect("first slot is free");
+        tx.try_send(batch("c", 1)).expect("second slot is free");
+        assert!(
+            matches!(
+                tx.try_send(batch("d", 1)),
+                Err(mpsc::error::TrySendError::Full(_))
+            ),
+            "a push in flight must stop the writer draining, so the channel fills and the \
+             handler can push back on Firehose"
+        );
+
+        // And once the push finishes the writer catches up, so this is backpressure rather
+        // than a deadlock.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        tx.try_send(batch("e", 1))
+            .expect("the channel must drain again once the push completes");
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+    }
+
+    /// Batches are accumulated, not overwritten: two receives before a flush must both be in
+    /// the payload. Without this, dropping the `for` loop's insert — or replacing the
+    /// accumulator wholesale on each receive — would still flush, still push a non-empty
+    /// body, and silently export only the last batch of every window.
+    #[tokio::test(start_paused = true)]
+    async fn every_received_batch_reaches_the_payload() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values(Some("3600"), Some("100000"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, send));
+
+        // One batch carrying two samples for one series, and two more series after it.
+        tx.send(vec![
+            (
+                labels("multi"),
+                Sample {
+                    value: 1.0,
+                    timestamp: 100,
+                },
+            ),
+            (
+                labels("multi"),
+                Sample {
+                    value: 2.0,
+                    timestamp: 200,
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+        tx.send(batch("second", 1)).await.unwrap();
+        tx.send(batch("third", 1)).await.unwrap();
+        let_the_writer_catch_up().await;
+        assert_eq!(BUFFER_SERIES.get(), 3.0, "three distinct series buffered");
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+
+        let body = flushes.recv().await.expect("shutdown must flush");
+        let decoded: WriteRequest = prost::Message::decode(
+            snap::raw::Decoder::new()
+                .decompress_vec(&body)
+                .expect("body must be snappy-compressed")
+                .as_slice(),
+        )
+        .expect("body must be a WriteRequest");
+
+        for name in ["multi", "second", "third"] {
+            let found = find_series(&decoded.timeseries, name)
+                .unwrap_or_else(|| panic!("{name} missing from the pushed payload"));
+            if name == "multi" {
+                assert_eq!(
+                    samples_of(found),
+                    vec![(100, 1.0), (200, 2.0)],
+                    "both samples of a repeated series must survive"
+                );
+            }
+        }
+        assert!(
+            find_series(&decoded.timeseries, "firehose_self_buffer_series").is_some(),
+            "the same push must also carry the app's own metrics"
+        );
     }
 }

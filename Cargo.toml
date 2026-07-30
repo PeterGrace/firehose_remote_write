@@ -40,3 +40,10 @@ tokio = { version = "1.37.0", features = ["test-util"] }
 aws-smithy-runtime = { version = "1.9.4", features = ["client", "test-util"] }
 aws-credential-types = { version = "1", features = ["test-util"] }
 http = "1.1"
+# `every_received_batch_reaches_the_payload` decodes the bytes the writer actually pushed,
+# rather than asserting on the `WriteRequest` it built. Those are different claims: the
+# encode step sits between them and is where "the body is snappy-compressed protobuf" is
+# either true or silently not. Both versions match what `prometheus_remote_write` already
+# resolves to in Cargo.lock, so this pulls nothing new into the build.
+prost = "0.12"
+snap = "1.1"
