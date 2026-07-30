@@ -10,6 +10,23 @@ use crate::structs::{CloudWatchMetric, MetricUnit};
 use prometheus_remote_write::{Label, Sample};
 
 /// Strip characters Prometheus does not allow in a metric name component.
+///
+/// Deletes invalid characters rather than replacing them with `_`, and that is deliberate:
+/// deletion is what the legacy path did, so it is what keeps existing series names intact.
+/// A live metric here is `DeliveryToHttpEndpoint.DataFreshness`, which renders as
+/// `deliverytohttpendpointdatafreshness`; switching to `_` replacement would rename it to
+/// `deliverytohttpendpoint_datafreshness` and break the user's dashboards. Avoiding renames
+/// is the whole reason this module re-applies the `firehose_` prefix by hand — do not
+/// undo it one line later.
+///
+/// Known tradeoff: deletion can collide, e.g. `a.b` and `ab` both yield `ab`. That is
+/// accepted. It only affects inputs already malformed today, and the blast radius is bounded
+/// at two metrics sharing a series.
+///
+/// Label *names* deliberately do NOT use this function — they use `to_case(Case::Snake)` with
+/// `_` replacement, matching their own legacy behavior. The rules differ because the stakes
+/// differ: a duplicate label name gets the entire write request rejected with a 400, whereas
+/// a colliding metric name merely merges two series.
 fn sanitize_metric_name(input: &str) -> String {
     input
         .chars()
@@ -96,15 +113,18 @@ mod tests {
         );
     }
 
-    /// Pin *which* guard fired, not just "some error". A bare `is_err()` would stay green if
-    /// this function later failed for an unrelated reason and stopped exercising the path
-    /// these tests exist to guard. Asserting the subject as well as the offending value also
-    /// holds the namespace and metric-name failures distinguishable to someone reading logs.
-    fn assert_error_names(err: anyhow::Error, subject: &str, value: &str) {
+    /// Pin *which* guard fired, not just "some error".
+    ///
+    /// `discriminator` must be the phrase unique to one failure mode, not a general category.
+    /// Passing a word the sibling guards share (e.g. "namespace", which every namespace error
+    /// interpolates) makes this assertion satisfiable by the wrong guard, so deleting the
+    /// guard under test leaves the suite green — coverage that reads real but detects nothing.
+    /// Mutation testing found exactly that hole here. Keep one distinct phrase per mode.
+    fn assert_error_names(err: anyhow::Error, discriminator: &str, value: &str) {
         let msg = format!("{err:#}");
         assert!(
-            msg.contains(subject) && msg.contains(value),
-            "expected error naming {subject} {value:?}, got: {msg}"
+            msg.contains(discriminator) && msg.contains(value),
+            "expected error matching {discriminator:?} and naming {value:?}, got: {msg}"
         );
     }
 
@@ -112,42 +132,42 @@ mod tests {
     fn metric_base_name_errors_when_namespace_has_no_slash() {
         let m = base("NoSlashHere", "Whatever", "Count");
         let err = metric_base_name(&m).expect_err("should not build a name");
-        assert_error_names(err, "namespace", "NoSlashHere");
+        assert_error_names(err, "no '/' separator", "NoSlashHere");
     }
 
     #[test]
     fn metric_base_name_errors_when_service_segment_is_empty() {
         let m = base("AWS/", "Whatever", "Count");
         let err = metric_base_name(&m).expect_err("should not build a name");
-        assert_error_names(err, "namespace", "AWS/");
+        assert_error_names(err, "no usable service segment", "AWS/");
     }
 
     #[test]
     fn metric_base_name_errors_when_service_segment_is_empty_between_slashes() {
         let m = base("AWS//Deep", "Whatever", "Count");
         let err = metric_base_name(&m).expect_err("should not build a name");
-        assert_error_names(err, "namespace", "AWS//Deep");
+        assert_error_names(err, "no usable service segment", "AWS//Deep");
     }
 
     #[test]
     fn metric_base_name_errors_when_service_segment_sanitizes_to_empty() {
         let m = base("AWS/!!!", "Whatever", "Count");
         let err = metric_base_name(&m).expect_err("should not build a name");
-        assert_error_names(err, "namespace", "AWS/!!!");
+        assert_error_names(err, "no usable service segment", "AWS/!!!");
     }
 
     #[test]
     fn metric_base_name_errors_when_metric_name_sanitizes_to_empty() {
         let m = base("AWS/Firehose", "!!!", "Count");
         let err = metric_base_name(&m).expect_err("should not build a name");
-        assert_error_names(err, "metric name", "!!!");
+        assert_error_names(err, "no usable characters", "!!!");
     }
 
     #[test]
     fn metric_base_name_errors_when_metric_name_is_all_punctuation() {
         let m = base("AWS/Firehose", "...", "Count");
         let err = metric_base_name(&m).expect_err("should not build a name");
-        assert_error_names(err, "metric name", "...");
+        assert_error_names(err, "no usable characters", "...");
     }
 
     #[test]
