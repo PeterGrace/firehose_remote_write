@@ -1,6 +1,7 @@
 pub(crate) mod aws;
 mod consts;
 mod prometheus;
+mod series;
 pub(crate) mod structs;
 
 #[macro_use]
