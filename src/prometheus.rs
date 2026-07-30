@@ -159,7 +159,7 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
         incoming_metric.namespace.clone(),
         incoming_metric.metric_name.clone(),
     )
-    .await;
+    .await?;
     labels.extend(dim_strs.iter().map(|s| s.as_str()));
     let mut lv_tree: BTreeMap<&str, &str> = BTreeMap::new();
     for label in labels.iter() {

@@ -26,43 +26,147 @@ impl AWSState {
         }
     }
 }
-pub async fn get_dimensions(region: String, namespace: String, metric: String) -> Vec<String> {
+/// Map a CloudWatch dimension name onto the label name we expose to Prometheus.
+///
+/// `region` collides with the top-level `region` label we set from the record itself,
+/// so a dimension of that name is prefixed.
+fn normalize_dimension_name(name: &str) -> String {
+    let key = name.to_case(Case::Snake);
+    match key.as_str() {
+        "region" => String::from("dimension_region"),
+        _ => key,
+    }
+}
+
+/// Fetch the set of dimension names CloudWatch reports for a given namespace/metric.
+///
+/// The returned names are normalized, sorted and deduplicated.
+async fn fetch_dimension_names(
+    client: &aws_sdk_cloudwatch::Client,
+    namespace: &str,
+    metric: &str,
+) -> anyhow::Result<Vec<String>> {
+    // ListMetrics caps each page at 500 results. Reading only the first page yields an
+    // incomplete dimension set, which silently collapses distinct CloudWatch series onto
+    // one Prometheus series, so page through the whole result set.
+    let mut pages = client
+        .list_metrics()
+        .namespace(namespace)
+        .metric_name(metric)
+        .into_paginator()
+        .send();
+
+    let mut dim_strs: Vec<String> = vec![];
+    while let Some(page) = pages.next().await {
+        for metric in page?.metrics().iter() {
+            for dim in metric.dimensions().iter() {
+                if let Some(name) = dim.name() {
+                    dim_strs.push(normalize_dimension_name(name));
+                }
+            }
+        }
+    }
+    dim_strs.sort();
+    dim_strs.dedup();
+    Ok(dim_strs)
+}
+
+pub async fn get_dimensions(
+    region: String,
+    namespace: String,
+    metric: String,
+) -> anyhow::Result<Vec<String>> {
     let cache_key = format!("{region}.{namespace}.{metric}");
     let mut dim = DIMENSION_HASH.lock().await;
     match dim.get(&cache_key) {
         None => {
             let aws = AWSState::initialize(region.clone()).await;
-            let metric_list = aws
-                .cloudwatch
-                .list_metrics()
-                .namespace(namespace.clone())
-                .metric_name(metric.clone())
-                .send()
-                .await
-                .unwrap();
-            let mut dim_strs: Vec<String> = vec![];
-            for metric in metric_list.metrics().iter() {
-                for dim in metric.dimensions().iter() {
-                    let mut key = dim.clone().name.unwrap().to_case(Case::Snake);
-                    match key.as_str() {
-                        "region" => key = String::from("dimension_region"),
-                        _ => {}
-                    };
-                    dim_strs.push(key);
-                }
-            }
-            dim_strs.sort();
-            dim_strs.dedup();
+            let dim_strs = fetch_dimension_names(&aws.cloudwatch, &namespace, &metric).await?;
             dim.insert(cache_key.clone(), dim_strs.clone());
             debug!("CREATED {cache_key}");
-            return dim_strs;
+            Ok(dim_strs)
         }
         Some(s) => {
             debug!("found {cache_key}");
-            return s.clone();
+            Ok(s.clone())
         }
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_credential_types::Credentials;
+    use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_types::body::SdkBody;
+
+    /// One page of a ListMetrics response carrying a single metric with a single dimension.
+    fn list_metrics_page(dimension_name: &str, next_token: Option<&str>) -> String {
+        let token = next_token
+            .map(|t| format!("<NextToken>{t}</NextToken>"))
+            .unwrap_or_default();
+        format!(
+            r#"<ListMetricsResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">
+  <ListMetricsResult>
+    <Metrics>
+      <member>
+        <Namespace>AWS/Test</Namespace>
+        <MetricName>TestMetric</MetricName>
+        <Dimensions>
+          <member>
+            <Name>{dimension_name}</Name>
+            <Value>some-value</Value>
+          </member>
+        </Dimensions>
+      </member>
+    </Metrics>
+    {token}
+  </ListMetricsResult>
+  <ResponseMetadata><RequestId>req-id</RequestId></ResponseMetadata>
+</ListMetricsResponse>"#
+        )
+    }
+
+    fn client_replaying(pages: Vec<String>) -> aws_sdk_cloudwatch::Client {
+        let events = pages
+            .into_iter()
+            .map(|body| {
+                ReplayEvent::new(
+                    http::Request::builder()
+                        .uri("https://monitoring.us-east-1.amazonaws.com/")
+                        .body(SdkBody::empty())
+                        .unwrap(),
+                    http::Response::builder()
+                        .status(200)
+                        .body(SdkBody::from(body))
+                        .unwrap(),
+                )
+            })
+            .collect();
+
+        let conf = aws_sdk_cloudwatch::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::for_tests())
+            .http_client(StaticReplayClient::new(events))
+            .build();
+        aws_sdk_cloudwatch::Client::from_conf(conf)
+    }
+
+    #[tokio::test]
+    async fn fetch_dimension_names_reads_every_page() {
+        let client = client_replaying(vec![
+            list_metrics_page("LoadBalancer", Some("page-2")),
+            list_metrics_page("TargetGroup", None),
+        ]);
+
+        let names = fetch_dimension_names(&client, "AWS/Test", "TestMetric")
+            .await
+            .unwrap();
+
+        assert_eq!(names, vec!["load_balancer", "target_group"]);
+    }
+}
+
 #[cached(time = 60, result = true)]
 pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
     let arn: ResourceName = firehose_stream_arn.parse()?;
