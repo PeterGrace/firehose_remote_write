@@ -1,3 +1,4 @@
+use prometheus::TextEncoder;
 use prometheus_remote_write::{Label, Sample, TimeSeries, WriteRequest};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -63,6 +64,100 @@ impl Accumulator {
                     .collect(),
             })
             .collect()
+    }
+}
+
+/// Combine CloudWatch series and app self-metrics into one request.
+///
+/// `sorted()` enforces the remote-write requirement that labels are sorted by name and
+/// samples by timestamp within each series.
+///
+/// # `sorted()` is belt-and-braces, and deliberately so
+///
+/// `WriteRequest::encode_proto3` — which `encode_compressed` calls — already sorts before
+/// encoding, so deleting the call here would still put sorted bytes on the wire *today*.
+/// It is kept because this function's contract is "returns a spec-conforming request",
+/// not "returns something that happens to be fixed up two layers down": every caller that
+/// inspects, logs or re-encodes the returned request without going through
+/// `encode_compressed` would otherwise see unsorted labels. That upstream sort is in a git
+/// dependency we do not control, and the failure it guards against — a receiver rejecting
+/// the batch for out-of-order labels — is silent data loss, not a compile error.
+///
+/// Note what `sorted()` does *not* do: it does not deduplicate series, so two `TimeSeries`
+/// carrying identical labels stay two entries in the payload. The accumulator guarantees
+/// one entry per label set on its side; the self-metric side is guaranteed by
+/// `from_text_format`, which folds samples into one series per label set as it parses.
+pub fn build_request(cloudwatch: Vec<TimeSeries>, self_metrics: Vec<TimeSeries>) -> WriteRequest {
+    let mut timeseries = cloudwatch;
+    timeseries.extend(self_metrics);
+    WriteRequest { timeseries }.sorted()
+}
+
+/// Gather app self-metrics from the client registry and convert them to series.
+///
+/// THIS IS THE ONLY PATH SELF-METRICS TAKE TO THE WIRE once Task 11 deletes
+/// `push_firehose_metrics`. If this is not called from the flush, every `self_*` counter
+/// and gauge becomes write-only: incremented forever, never exported, and invisible
+/// exactly when something is going wrong.
+///
+/// Returns an empty vec on failure rather than losing the CloudWatch data sharing this flush.
+///
+/// # The round-trip through the text format is lossy, in ways that matter
+///
+/// `gather()` → text → `from_text_format` is not an encoding detail, it is a conversion with
+/// three observable consequences, all measured by `self_metric_series_round_trips_*`:
+///
+/// * **Timestamps are invented.** The text encoder omits a timestamp for any metric that
+///   was never given one, and `prometheus_parse` stamps those samples with `Utc::now()` at
+///   parse time. Self-metrics are therefore stamped at flush time, which is the correct
+///   answer for a counter read at flush time — but it is a *parse-time* clock, not the
+///   value's own, so it is only as accurate as the flush is prompt.
+/// * **Histograms and summaries are rejected outright.** `samples_to_timeseries` returns
+///   `Err` for both, and it fails the *whole* request, not the offending family — one
+///   registered histogram would silently zero every self-metric on every flush. We register
+///   none today (the `HISTOGRAMS` map is never populated); if that changes, this must stop
+///   going through the text format.
+/// * **`HELP`/`TYPE` lines are metadata and simply do not become samples**, which is why
+///   a family that has never been touched contributes nothing rather than a zero.
+///
+/// # One mutant survives here, knowingly
+///
+/// Making the `Err` arm below return a non-empty vec kills no test, and that is *not* a
+/// claim that the branch is unreachable in principle — it is that nothing in this process
+/// can reach it. `TextEncoder::encode_to_string` writes into a `String`, so its only I/O
+/// failure is `std::fmt::Error`, which `String` never returns; its other failure is
+/// `check_metric_family`, which rejects a family with no metrics or no name — and
+/// `Registry::gather` prunes empty families before returning and validates names at
+/// registration. The arm is a guard against a future caller that feeds this something other
+/// than `gather()`'s output, and it is written to fail the same way the parse arm does.
+/// Recorded rather than deleted, and recorded rather than left to look like an oversight.
+pub fn self_metric_series() -> Vec<TimeSeries> {
+    let families = ::prometheus::gather();
+    match TextEncoder::new().encode_to_string(&families) {
+        Ok(text) => series_from_text(text),
+        Err(e) => {
+            error!("could not encode self-metrics: {e}");
+            vec![]
+        }
+    }
+}
+
+/// Parse gathered self-metrics, or give up on them without giving up on the flush.
+///
+/// Split out from [`self_metric_series`] purely so the failure arm can be *reached*. Driving
+/// it through the real function means registering a histogram, and `prometheus::gather()`
+/// reads a process-global registry that is never torn down — so a test that did it would
+/// permanently empty the self-metric payload for every other test in the binary, which is
+/// the production failure this arm exists to survive, reproduced inside the test harness.
+/// With the seam, `a_parse_failure_returns_no_series_and_says_why` drives the arm directly
+/// on text; without it, deleting the arm's `vec![]` (or its `error!`) killed nothing.
+fn series_from_text(text: String) -> Vec<TimeSeries> {
+    match WriteRequest::from_text_format(text) {
+        Ok(req) => req.timeseries,
+        Err(e) => {
+            error!("could not convert self-metrics: {e}");
+            vec![]
+        }
     }
 }
 
@@ -541,6 +636,345 @@ mod tests {
             .map(|l| (l.name.as_str(), l.value.as_str()))
             .collect();
         assert_eq!(got, want);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // build_request
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn build_request_carries_accumulated_series() {
+        let mut acc = Accumulator::new();
+        acc.insert(
+            labels("a"),
+            Sample {
+                value: 1.0,
+                timestamp: 100,
+            },
+        );
+        acc.insert(
+            labels("b"),
+            Sample {
+                value: 2.0,
+                timestamp: 100,
+            },
+        );
+
+        let req = build_request(acc.drain(), vec![]);
+        assert_eq!(req.timeseries.len(), 2);
+    }
+
+    #[test]
+    fn build_request_merges_self_metrics_into_the_same_payload() {
+        let mut acc = Accumulator::new();
+        acc.insert(
+            labels("cloudwatch_series"),
+            Sample {
+                value: 1.0,
+                timestamp: 100,
+            },
+        );
+
+        let self_series = vec![TimeSeries {
+            labels: labels("firehose_self_metric"),
+            samples: vec![Sample {
+                value: 9.0,
+                timestamp: 100,
+            }],
+        }];
+
+        let req = build_request(acc.drain(), self_series);
+        assert_eq!(req.timeseries.len(), 2, "one HTTP call carries both");
+    }
+
+    #[test]
+    fn build_request_sorts_labels_within_each_series() {
+        let unsorted = vec![
+            Label {
+                name: "zzz".into(),
+                value: "1".into(),
+            },
+            Label {
+                name: "aaa".into(),
+                value: "2".into(),
+            },
+        ];
+        let req = build_request(
+            vec![TimeSeries {
+                labels: unsorted,
+                samples: vec![Sample {
+                    value: 1.0,
+                    timestamp: 1,
+                }],
+            }],
+            vec![],
+        );
+        let names: Vec<&str> = req.timeseries[0]
+            .labels
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["aaa", "zzz"]);
+    }
+
+    /// Pull one named series out of a `self_metric_series()` result.
+    fn find_series<'a>(series: &'a [TimeSeries], name: &str) -> Option<&'a TimeSeries> {
+        series.iter().find(|s| {
+            s.labels
+                .iter()
+                .any(|l| l.name == "__name__" && l.value == name)
+        })
+    }
+
+    fn label_of<'a>(series: &'a TimeSeries, name: &str) -> Option<&'a str> {
+        series
+            .labels
+            .iter()
+            .find(|l| l.name == name)
+            .map(|l| l.value.as_str())
+    }
+
+    /// The whole self-metric export is a round trip through the Prometheus **text** format:
+    /// `gather()` produces protobuf families, `TextEncoder` renders them to text, and
+    /// `from_text_format` re-parses that text into series. Three separate representations,
+    /// two conversions, and no compiler checking that anything survives.
+    ///
+    /// The load-bearing assertion is the `instance` **const** label. It is baked in at
+    /// registration by `self_metric_opts!` and has no call site anywhere, so if the text
+    /// round trip dropped it nothing else in the suite would notice: the metric would still
+    /// register, still increment, still gather with the label attached (which is all
+    /// `every_self_metric_registers_with_the_instance_const_label` checks), and simply arrive
+    /// at the remote unattributable to a replica.
+    ///
+    /// Measured result: const labels DO survive. `TextEncoder` does not distinguish const
+    /// labels from variable ones — by the time it sees a `MetricFamily` they are both just
+    /// entries in the metric's label list — so they render as ordinary `name="value"` pairs
+    /// and parse straight back.
+    #[test]
+    fn self_metric_series_round_trips_a_counter_with_its_const_label() {
+        let _log = LogTail::start();
+        // Registers the metric via `lazy_static` if some earlier test has not already, and
+        // guarantees it is non-zero so the text encoder emits a line for it.
+        crate::prometheus::RECORDS_SKIPPED.inc();
+
+        let series = self_metric_series();
+        let found = find_series(&series, "firehose_self_records_skipped_count")
+            .unwrap_or_else(|| panic!("self-metric missing from the round trip: {series:?}"));
+
+        assert_eq!(
+            label_of(found, "instance"),
+            Some(crate::prometheus::instance_label()),
+            "the instance const label must survive gather -> text -> parse, got {found:?}"
+        );
+        assert!(
+            !found.samples.is_empty(),
+            "a touched counter must carry a sample"
+        );
+        assert!(
+            found.samples.iter().all(|s| s.value >= 1.0),
+            "the counter's value must survive, got {:?}",
+            found.samples
+        );
+    }
+
+    /// Untimestamped metrics — which every self-metric is, since nothing calls
+    /// `set_timestamp_ms` on them — are stamped by `prometheus_parse` with `Utc::now()` at
+    /// **parse** time. That is the right answer for a counter read during the flush, but it
+    /// is worth pinning as behaviour rather than leaving it to be rediscovered: it means the
+    /// self-metric timestamp is the flush clock, not the value's own clock, and a series
+    /// arriving with timestamp 0 (or a 1970 date, or a far-future one) would be silently
+    /// rejected or misfiled by the receiver.
+    ///
+    /// The window is deliberately generous — a stopped clock or a seconds/millis unit mixup
+    /// is what this catches, not a slow test runner.
+    #[test]
+    fn self_metric_series_stamps_untimestamped_samples_at_parse_time() {
+        let _log = LogTail::start();
+        crate::prometheus::REJECTED_PAYLOADS.inc();
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let series = self_metric_series();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let found = find_series(&series, "firehose_self_rejected_payloads_count")
+            .expect("self-metric should round trip");
+        let ts = found.samples[0].timestamp;
+        assert!(
+            ts >= before - 60_000 && ts <= after + 60_000,
+            "expected a parse-time millisecond timestamp near {before}..{after}, got {ts}"
+        );
+    }
+
+    /// `from_text_format` fails the **whole request** on a histogram or summary rather than
+    /// skipping the offending family: `samples_to_timeseries` returns `Err` on the first one
+    /// it meets and the `?` discards everything parsed so far. One registered histogram would
+    /// therefore silently zero *every* self-metric on *every* flush, forever, and the only
+    /// evidence would be one `error!` line per flush.
+    ///
+    /// We register no histograms today — the `HISTOGRAMS` map exists but nothing inserts into
+    /// it — so this pins the hazard against the parser directly rather than polluting the
+    /// process-global registry with a histogram that every other test would then inherit.
+    #[test]
+    fn from_text_format_rejects_the_entire_payload_when_a_histogram_is_present() {
+        let _log = LogTail::start();
+        let healthy = "# HELP ok a counter\n# TYPE ok counter\nok{instance=\"x\"} 5\n";
+        assert_eq!(
+            WriteRequest::from_text_format(healthy.to_string())
+                .expect("a plain counter must parse")
+                .timeseries
+                .len(),
+            1,
+            "control: the healthy half of this input parses on its own"
+        );
+
+        let with_histogram = format!(
+            "{healthy}# HELP h a histogram\n# TYPE h histogram\n\
+             h_bucket{{le=\"1\"}} 1\nh_bucket{{le=\"+Inf\"}} 1\nh_sum 0.5\nh_count 1\n"
+        );
+        let err = WriteRequest::from_text_format(with_histogram)
+            .expect_err("a histogram must not be silently accepted");
+        assert!(
+            err.to_string().contains("histogram"),
+            "the failure must name the unsupported type, got: {err}"
+        );
+    }
+
+    /// `HELP` and `TYPE` lines are metadata, not samples, so a registered-but-never-touched
+    /// family contributes nothing to the payload rather than a spurious zero. Pinned because
+    /// the alternative reading — that every registered family emits something — is what would
+    /// make `self_metric_series` look like a safe place to register speculative metrics.
+    ///
+    /// Note this is a property of the *text* format, not of `gather()`: a `Counter` that has
+    /// never been incremented still gathers, and still renders as an explicit `0`. It is a
+    /// family with no children (an untouched `*Vec`) that vanishes.
+    #[test]
+    fn help_and_type_lines_alone_produce_no_series() {
+        let _log = LogTail::start();
+        let metadata_only = "# HELP lonely a metric nobody touched\n# TYPE lonely counter\n";
+        let req = WriteRequest::from_text_format(metadata_only.to_string())
+            .expect("metadata-only input must parse rather than error");
+        assert!(
+            req.timeseries.is_empty(),
+            "metadata must not manufacture series, got {:?}",
+            req.timeseries
+        );
+    }
+
+    /// `build_request` is handed self-metric series it did not build, so it cannot assume the
+    /// accumulator's guarantees about them. `sorted()` fixes label order and sample order —
+    /// this pins the sample half, which `build_request_sorts_labels_within_each_series` does
+    /// not see, and which the accumulator would never produce a violation of.
+    #[test]
+    fn build_request_sorts_samples_by_timestamp_within_each_series() {
+        let scrambled = vec![
+            Sample {
+                value: 3.0,
+                timestamp: 300,
+            },
+            Sample {
+                value: 1.0,
+                timestamp: 100,
+            },
+            Sample {
+                value: 2.0,
+                timestamp: 200,
+            },
+        ];
+        let req = build_request(
+            vec![],
+            vec![TimeSeries {
+                labels: labels("m"),
+                samples: scrambled,
+            }],
+        );
+        assert_eq!(
+            samples_of(&req.timeseries[0]),
+            vec![(100, 1.0), (200, 2.0), (300, 3.0)]
+        );
+    }
+
+    /// `sorted()` does NOT deduplicate: two `TimeSeries` with identical labels stay two
+    /// entries in the payload, and a remote write receiver reading them in order sees a
+    /// duplicate or out-of-order sample. Stated as a test because it is the precondition
+    /// `build_request` silently relies on — the accumulator guarantees one entry per label
+    /// set, and `from_text_format` folds parsed samples into one series per label set, so
+    /// neither input can produce a collision today. A future caller passing hand-built
+    /// series has no such protection.
+    #[test]
+    fn build_request_does_not_merge_two_series_sharing_a_label_set() {
+        let req = build_request(
+            vec![TimeSeries {
+                labels: labels("m"),
+                samples: vec![Sample {
+                    value: 1.0,
+                    timestamp: 100,
+                }],
+            }],
+            vec![TimeSeries {
+                labels: labels("m"),
+                samples: vec![Sample {
+                    value: 2.0,
+                    timestamp: 100,
+                }],
+            }],
+        );
+        assert_eq!(
+            req.timeseries.len(),
+            2,
+            "sorted() does not dedup; callers must not hand it colliding label sets"
+        );
+    }
+
+    /// The failure arm must yield *nothing*, not a partial or placeholder payload: a
+    /// conversion that failed but returned a series would push a value nobody computed, and
+    /// one that propagated would take the CloudWatch data sharing this flush down with it.
+    ///
+    /// It must also *say so*. This arm is how "every self-metric silently reads zero" looks
+    /// from the inside, and the only evidence available to whoever is debugging it is this
+    /// log line — the CloudWatch data keeps flowing, the process keeps serving, and the
+    /// dashboards for the exporter itself go flat.
+    #[test]
+    fn a_parse_failure_returns_no_series_and_says_why() {
+        let tail = LogTail::start();
+        let unparseable = "# TYPE writer_hist_aa histogram\nwriter_hist_aa_bucket{le=\"+Inf\"} 1\n\
+             writer_hist_aa_sum 1\nwriter_hist_aa_count 1\n";
+
+        let series = series_from_text(unparseable.to_string());
+        let logs = tail.tail();
+
+        assert!(
+            series.is_empty(),
+            "a failed conversion must contribute nothing, got {series:?}"
+        );
+        assert!(
+            logs.contains("could not convert self-metrics"),
+            "the failure must be visible in the log, got: {logs}"
+        );
+    }
+
+    /// The other half of the contract, and the one that makes "empty on failure" mean
+    /// anything: the healthy path is genuinely non-empty. Without this, a `self_metric_series`
+    /// that always returned `vec![]` would satisfy every failure assertion above while
+    /// exporting nothing at all.
+    #[test]
+    fn the_success_path_returns_series_so_empty_is_a_real_signal() {
+        let _log = LogTail::start();
+        crate::prometheus::BATCHES_DROPPED.inc();
+        let series = self_metric_series();
+        assert!(
+            !series.is_empty(),
+            "the success path must return series, or the empty-on-failure contract is vacuous"
+        );
+        assert!(
+            find_series(&series, "firehose_self_batches_dropped_count").is_some(),
+            "the metric this test touched must be in the payload, got {series:?}"
+        );
     }
 
     // ---------------------------------------------------------------------------------
