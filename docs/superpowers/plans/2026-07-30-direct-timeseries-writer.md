@@ -1857,6 +1857,29 @@ Update the freshness task to use `state.firehose_arns.read().await.clone()`.
 
 Remove the unreachable `loop {}` after `axum::serve(...).await.unwrap();`.
 
+- [ ] **Step 1b: Populate `APP_INFO`, and fix its double prefix**
+
+`APP_INFO` is registered but never set outside a test, so it has never appeared in
+`gather()` output — there is currently no way to tell which build is running from
+metrics. Separately, `build.rs` shells out to `git rev-parse HEAD` on every build to set
+a `GIT_HASH` env var that no code reads.
+
+Its name is `"firehose_app_info"` and `app_opts!` prefixes the `firehose` namespace on
+top, so it would emit as `firehose_firehose_app_info`. **Rename it to `"app_info"` now** —
+this is free only because the metric has never been emitted, so no dashboard or alert
+depends on the name. Once it is populated, the rename stops being free.
+
+In `main()`, after the subscriber is installed:
+
+```rust
+    APP_INFO
+        .with_label_values(&[env!("CARGO_PKG_VERSION"), env!("GIT_HASH").trim()])
+        .set(1.0);
+```
+
+`GIT_HASH` carries a trailing newline from `git rev-parse` (`build.rs` does not trim it),
+which would otherwise become part of the label value.
+
 - [ ] **Step 2: Delete dead code**
 
 From `src/prometheus.rs` delete: `GAUGES`, `COUNTERS`, `HISTOGRAMS`, the `GaugeHash`,
