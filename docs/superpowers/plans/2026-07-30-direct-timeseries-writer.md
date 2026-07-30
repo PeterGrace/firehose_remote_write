@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(c.flush_interval_secs, 1);
         assert_eq!(c.flush_max_series, 2000);
         assert_eq!(c.channel_capacity, 1024);
-        assert_eq!(c.push_max_retries, 3);
+        assert_eq!(c.push_max_attempts, 3);
     }
 
     #[test]
@@ -871,7 +871,7 @@ mod tests {
         assert_eq!(c.flush_interval_secs, 5);
         assert_eq!(c.flush_max_series, 10);
         assert_eq!(c.channel_capacity, 20);
-        assert_eq!(c.push_max_retries, 7);
+        assert_eq!(c.push_max_attempts, 7);
     }
 
     #[test]
@@ -905,7 +905,7 @@ pub struct Config {
     pub flush_interval_secs: u64,
     pub flush_max_series: usize,
     pub channel_capacity: usize,
-    pub push_max_retries: u32,
+    pub push_max_attempts: u32,
 }
 
 fn parse_or<T: std::str::FromStr>(raw: Option<&str>, default: T) -> T {
@@ -918,7 +918,7 @@ impl Config {
         flush_interval_secs: Option<&str>,
         flush_max_series: Option<&str>,
         channel_capacity: Option<&str>,
-        push_max_retries: Option<&str>,
+        push_max_attempts: Option<&str>,
     ) -> Self {
         let flush_interval_secs = parse_or(flush_interval_secs, 1u64);
         let flush_max_series = parse_or(flush_max_series, 2000usize);
@@ -929,7 +929,7 @@ impl Config {
             flush_interval_secs: if flush_interval_secs == 0 { 1 } else { flush_interval_secs },
             flush_max_series: if flush_max_series == 0 { 2000 } else { flush_max_series },
             channel_capacity: if channel_capacity == 0 { 1024 } else { channel_capacity },
-            push_max_retries: parse_or(push_max_retries, 3u32),
+            push_max_attempts: parse_or(push_max_attempts, 3u32),
         }
     }
 
@@ -938,7 +938,7 @@ impl Config {
             env::var("FLUSH_INTERVAL_SECS").ok().as_deref(),
             env::var("FLUSH_MAX_SERIES").ok().as_deref(),
             env::var("CHANNEL_CAPACITY").ok().as_deref(),
-            env::var("PUSH_MAX_RETRIES").ok().as_deref(),
+            env::var("PUSH_MAX_ATTEMPTS").ok().as_deref(),
         )
     }
 }
@@ -1082,12 +1082,14 @@ pub enum PushOutcome {
 ///
 /// Generic over the send closure rather than a trait so the retry policy is testable
 /// without an HTTP stack or a mocking dependency.
-pub async fn push_with_retry<F, Fut>(body: Vec<u8>, max_retries: u32, mut send: F) -> PushOutcome
+pub async fn push_with_retry<F, Fut>(body: Vec<u8>, max_attempts: u32, mut send: F) -> PushOutcome
 where
     F: FnMut(Vec<u8>) -> Fut,
     Fut: Future<Output = anyhow::Result<u16>>,
 {
-    let attempts = max_retries.max(1);
+    // Named attempts, not retries: with a floor of 1, `0` and `1` both mean a single
+    // attempt, and calling the field `retries` made those two settings read as different.
+    let attempts = max_attempts.max(1);
     for attempt in 0..attempts {
         match send(body.clone()).await {
             Ok(status) if (200..300).contains(&status) => return PushOutcome::Delivered,
@@ -1482,7 +1484,7 @@ where
 
     // `&mut F` implements `FnMut` when `F: FnMut`, so reborrowing satisfies
     // `push_with_retry`'s by-value parameter without giving up ownership of `send`.
-    if push_with_retry(body, config.push_max_retries, &mut *send).await == PushOutcome::Dropped {
+    if push_with_retry(body, config.push_max_attempts, &mut *send).await == PushOutcome::Dropped {
         BATCHES_DROPPED.with_label_values(&[instance]).inc();
     }
 
