@@ -72,6 +72,14 @@ lazy_static! {
         &["status_code"]
     )
     .unwrap();
+    pub static ref RECORDS_SKIPPED: CounterVec = register_counter_vec!(
+        app_opts!(
+            "self_records_skipped_count",
+            "The number of records skipped due to decode errors or unrecognized metric units"
+        ),
+        &["reason"]
+    )
+    .unwrap();
 }
 
 pub async fn push_firehose_metrics() -> anyhow::Result<bool> {
@@ -219,6 +227,24 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
         | MetricUnit::BytesPerSecond
         | MetricUnit::Milliseconds
         | MetricUnit::Microseconds
+        | MetricUnit::Kilobytes
+        | MetricUnit::Megabytes
+        | MetricUnit::Gigabytes
+        | MetricUnit::Terabytes
+        | MetricUnit::Bits
+        | MetricUnit::Kilobits
+        | MetricUnit::Megabits
+        | MetricUnit::Gigabits
+        | MetricUnit::Terabits
+        | MetricUnit::KilobytesPerSecond
+        | MetricUnit::MegabytesPerSecond
+        | MetricUnit::GigabytesPerSecond
+        | MetricUnit::TerabytesPerSecond
+        | MetricUnit::BitsPerSecond
+        | MetricUnit::KilobitsPerSecond
+        | MetricUnit::MegabitsPerSecond
+        | MetricUnit::GigabitsPerSecond
+        | MetricUnit::TerabitsPerSecond
         | MetricUnit::None => {
             for (suffix, value) in [
                 ("max", incoming_metric.value.max),
@@ -244,7 +270,11 @@ pub async fn record_metric(incoming_metric: CloudWatchMetric) -> anyhow::Result<
         //     warn!("Received a count -- need to implement this")
         // }
         MetricUnit::Unknown => {
-            warn!("Received unknown metric, {:#?}", incoming_metric.clone());
+            warn!(
+                "Received unrecognized metric unit, {:#?}",
+                incoming_metric.clone()
+            );
+            RECORDS_SKIPPED.with_label_values(&["unknown_unit"]).inc();
         }
     }
     Ok(())

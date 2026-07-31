@@ -9,7 +9,9 @@ extern crate tracing;
 extern crate anyhow;
 
 use crate::aws::get_freshness;
-use crate::prometheus::{push_firehose_metrics, record_metric, FRESHNESS_INFO, STREAMS_RECEIVED};
+use crate::prometheus::{
+    push_firehose_metrics, record_metric, FRESHNESS_INFO, RECORDS_SKIPPED, STREAMS_RECEIVED,
+};
 use crate::structs::SharedState;
 use crate::structs::{AppState, FirehoseData, FirehoseResponse};
 use crate::structs::{CloudWatchMetric, Firehose, MetricUnit, MetricValue};
@@ -104,14 +106,17 @@ async fn get_firehose(
     let mut payload_message: String = String::from("");
 
     if let Some(source_arn) = headers.get("X-Amz-Firehose-Source-Arn") {
-        state.write().await.firehose_arns.insert(source_arn.to_str().unwrap().to_string());
-
+        state
+            .write()
+            .await
+            .firehose_arns
+            .insert(source_arn.to_str().unwrap().to_string());
     } else if let Some(firehose) = payload.source_arn {
         state.write().await.firehose_arns.insert(firehose);
     } else {
         warn!("Could not find source arn in headers or payload for this request.")
     }
-    
+
     if let Some(records) = payload.records {
         // although it's not beyond belief that amazon would send us malformed b64, it's unlikely,
         // so I'm skipping error processing here for now
@@ -130,7 +135,8 @@ async fn get_firehose(
                 continue;
             }
         } else {
-            debug!("unable to decode cloudmetric");
+            warn!("unable to decode cloudmetric");
+            RECORDS_SKIPPED.with_label_values(&["decode_error"]).inc();
         }
     }
     STREAMS_RECEIVED.with_label_values(&[]).inc();
@@ -170,11 +176,7 @@ async fn get_firehose(
                     error_message: Some(msg),
                 };
                 error!("{response:#?}");
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(response),
-                ))
-
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(response)))
             }
         }
     }
