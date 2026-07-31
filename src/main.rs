@@ -507,12 +507,24 @@ fn undecoded_content_encoding(headers: &HeaderMap) -> Option<String> {
 /// there is what makes the check a *bound*: `get_freshness` runs per tick, this runs once per
 /// ARN.
 ///
-/// The three conditions correspond to the three ways the assumption can break:
+/// The governing rule is that **this must require exactly what `get_freshness` requires**.
+/// An ARN that passes here but that `get_freshness` cannot act on is worse than useless: it
+/// is a permanently occupied slot out of [`MAX_TRACKED_ARNS`]. Because the cap refuses rather
+/// than evicts -- rightly, see its docs -- every such entry is a slot a caller took for free,
+/// and 64 of them permanently deny tracking to real delivery streams. So a gap between what
+/// this accepts and what that function can use is not inefficiency, it is a denial vector.
+///
+/// The four conditions correspond to the four ways the assumption can break:
 ///
 /// * **It parses.** `aws_arn` is stricter than "starts with `arn:`": six colon-separated
 ///   components, an `aws`-prefixed partition, and an account ID of exactly twelve digits.
 /// * **The service is `firehose`.** A perfectly well-formed S3 or SQS ARN would otherwise be
 ///   polled against the Firehose namespace forever.
+/// * **It carries a region.** `get_freshness` opens its client with `if let Some(region) =
+///   arn.region` and returns `Err` outright when there is none, so a region-less ARN is
+///   definitively unusable -- and the region field is optional in the grammar, so one parses
+///   perfectly well. This costs no API calls per tick, which is exactly what made it easy to
+///   dismiss; the cost is the slot, not the calls.
 /// * **The resource is `deliverystream/<name>`.** `path_split` yields exactly two components
 ///   for that shape. Requiring exactly two rejects a bare resource ID with no type prefix
 ///   (`split("/").last()` would hand CloudWatch the entire resource as a stream name) and a
@@ -529,6 +541,9 @@ fn is_delivery_stream_arn(candidate: &str) -> bool {
         return false;
     };
     if arn.service != Identifier::from(Service::Firehose) {
+        return false;
+    }
+    if arn.region.is_none() {
         return false;
     }
     match arn.resource.path_split().as_slice() {
@@ -1745,6 +1760,12 @@ mod tests {
                 false,
                 "right service, two-component resource, wrong resource type: the only case \
                  the resource-type check alone rejects",
+            ),
+            (
+                "arn:aws:firehose::123456789012:deliverystream/noregion",
+                false,
+                "right service, right shape, no region: `get_freshness` cannot act on it, \
+                 and it is the only case the region check alone rejects",
             ),
             (
                 "arn:aws:firehose:us-east-1:123456789012:my-queue",
