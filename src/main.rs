@@ -23,6 +23,8 @@ use crate::series::to_series;
 use crate::structs::{AppState, FirehoseData, FirehoseResponse};
 use crate::structs::{CloudWatchMetric, Firehose};
 use crate::writer::run_writer;
+use aws_arn::known::Service;
+use aws_arn::{Identifier, ResourceName};
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, State};
@@ -79,6 +81,45 @@ const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// request schema and duplicated into the `X-Amz-Firehose-Request-Id` header. It is reachable
 /// from anything else that POSTs here, which is why it must not panic.
 const MISSING_REQUEST_ID: &str = "missing-request-id";
+
+/// The most distinct source ARNs this process will ever track.
+///
+/// The set is fed from `X-Amz-Firehose-Source-Arn`, or the body's `source_arn` -- both
+/// caller-controlled -- and the freshness task in `main` iterates the whole set every 60
+/// seconds calling [`aws::get_freshness`], which makes **two** CloudWatch calls per entry
+/// (`list_metrics` then `get_metric_data`). So an unbounded set is not merely unbounded
+/// memory; it is 2N API calls per minute, forever, at the sender's discretion. A third leak
+/// hangs off the same string: `get_freshness` is `#[cached]` keyed on the ARN, so its
+/// memoisation map grows with the set. One bound closes all three, which is why the fix is
+/// here and not in any of the three places that suffer from it.
+///
+/// 64 is a ceiling rather than a working size. The number of delivery streams pointed at one
+/// deployment of this endpoint is a configuration fact, not a growth dimension; a deployment
+/// that genuinely needs more should raise this deliberately.
+///
+/// # Full means refuse, not evict
+///
+/// Eviction reads as the friendlier policy and is the more dangerous one: it would let any
+/// caller displace a real delivery stream's entry simply by supplying 64 ARNs of its own,
+/// silently ending freshness reporting for the streams that matter. Refusal fails the other
+/// way -- at worst a genuinely new stream goes untracked, which is one `warn!` away from
+/// being noticed and one config change away from being fixed. Given a choice between losing
+/// observability of a known stream and declining to gain it for a new one, decline.
+const MAX_TRACKED_ARNS: usize = 64;
+
+/// The resource type carried by every Firehose delivery-stream ARN: `deliverystream/<name>`.
+const DELIVERY_STREAM_RESOURCE_TYPE: &str = "deliverystream";
+
+/// Logged when a source ARN is not something this process could meaningfully poll.
+///
+/// A constant rather than a literal because the tests assert on it. Sharing the string means
+/// the assertion cannot quietly drift off the message it is watching -- which for a `warn!`
+/// whose entire job is to make a silent refusal audible is the failure that matters.
+const NOT_A_DELIVERY_STREAM_WARNING: &str = "not a Firehose delivery-stream ARN";
+
+/// Logged when [`MAX_TRACKED_ARNS`] is reached and a new ARN is therefore refused. Shared
+/// with the tests for the same reason as [`NOT_A_DELIVERY_STREAM_WARNING`].
+const AT_CAPACITY_WARNING: &str = "tracked source ARN set is full";
 
 /// How long one whole remote-write request may take before reqwest abandons it.
 ///
@@ -456,23 +497,101 @@ fn undecoded_content_encoding(headers: &HeaderMap) -> Option<String> {
         .filter(|v| !v.eq_ignore_ascii_case("identity"))
 }
 
-/// Record the ARN we are receiving from, taking the exclusive lock only when it is new.
+/// Is this string an ARN naming a Firehose delivery stream?
 ///
-/// The previous version took `write()` unconditionally on every request, which serialised
-/// every concurrent handler behind one exclusive acquisition in order to re-insert a value
-/// that was already there. The set converges after the first request from each delivery
-/// stream and then never changes again, so the write path is effectively startup-only while
-/// the read path is per-request.
+/// Specifically: is it the shape [`aws::get_freshness`] already assumes it has been given?
+/// That function recovers the stream name with `arn.resource.to_string().split("/").last()`
+/// and queries the `AWS/Firehose` namespace with it as a `DeliveryStreamName` dimension, so
+/// anything else produces a well-formed query about a thing that does not exist -- two
+/// CloudWatch calls a minute spent asking a meaningless question. Checking here rather than
+/// there is what makes the check a *bound*: `get_freshness` runs per tick, this runs once per
+/// ARN.
+///
+/// The three conditions correspond to the three ways the assumption can break:
+///
+/// * **It parses.** `aws_arn` is stricter than "starts with `arn:`": six colon-separated
+///   components, an `aws`-prefixed partition, and an account ID of exactly twelve digits.
+/// * **The service is `firehose`.** A perfectly well-formed S3 or SQS ARN would otherwise be
+///   polled against the Firehose namespace forever.
+/// * **The resource is `deliverystream/<name>`.** `path_split` yields exactly two components
+///   for that shape. Requiring exactly two rejects a bare resource ID with no type prefix
+///   (`split("/").last()` would hand CloudWatch the entire resource as a stream name) and a
+///   deeper path alike (whose last segment is not the stream name either). The name must be
+///   non-empty, or the dimension value would be blank.
+///
+/// The resource type is matched case-insensitively. AWS emits it lowercase, so this only ever
+/// widens acceptance -- and it widens it by nothing an attacker gains from, since a
+/// mixed-case `DeliveryStream/x` buys exactly what `deliverystream/x` already buys. The
+/// asymmetry runs the other way: being strict here would silently drop freshness for a real
+/// stream if the casing ever varied, to purchase no security at all.
+fn is_delivery_stream_arn(candidate: &str) -> bool {
+    let Ok(arn) = candidate.parse::<ResourceName>() else {
+        return false;
+    };
+    if arn.service != Identifier::from(Service::Firehose) {
+        return false;
+    }
+    match arn.resource.path_split().as_slice() {
+        [resource_type, stream_name] => {
+            resource_type.eq_ignore_ascii_case(DELIVERY_STREAM_RESOURCE_TYPE)
+                && !stream_name.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Record the ARN we are receiving from, if it is one we could poll and there is room for it.
+///
+/// # Why this is validated and bounded at all
+///
+/// Both sources of this value -- the `X-Amz-Firehose-Source-Arn` header and the body's
+/// `source_arn` -- are supplied by whoever is POSTing, and nothing downstream ever removes an
+/// entry. See [`MAX_TRACKED_ARNS`] for what an unbounded set costs per minute, and
+/// [`is_delivery_stream_arn`] for what "one we could poll" means.
+///
+/// Both refusals `warn!`, with distinguishable messages naming the offending value or the
+/// cap. A silent refusal would leave an operator staring at a delivery stream with no
+/// freshness metric and no reason given, which is the whole failure mode this guards against
+/// reproduced one layer up.
+///
+/// # Lock discipline
+///
+/// An earlier version took `write()` unconditionally on every request, which serialised every
+/// concurrent handler behind one exclusive acquisition in order to re-insert a value that was
+/// already there. The set converges after the first request from each delivery stream and
+/// then never changes again, so the write path is effectively startup-only while the read
+/// path is per-request.
+///
+/// The membership check comes first, and stays first: it is both the hot path and the reason
+/// validation costs nothing per request -- an ARN already in the set has already been
+/// validated, so re-parsing it every time would buy nothing.
 ///
 /// The read guard is dropped before the write is attempted -- `tokio::sync::RwLock` is not
 /// reentrant, and upgrading in place by holding both would deadlock the handler against
 /// itself. The gap between the two means two requests carrying the same new ARN can both
-/// decide to write; `HashSet::insert` makes that idempotent.
+/// decide to write. `HashSet::insert` makes that idempotent; the one visible artefact is that
+/// if the pair straddles the cap the loser logs a spurious "full" warning about an ARN that
+/// is in fact tracked. That is a redundant log line in a race, not a lost ARN, and closing it
+/// would mean a second membership test under the write lock that nothing else needs.
 async fn remember_source_arn(state: &AppState, arn: String) {
     if state.firehose_arns.read().await.contains(&arn) {
         return;
     }
-    state.firehose_arns.write().await.insert(arn);
+    if !is_delivery_stream_arn(&arn) {
+        warn!("ignoring source arn {arn:?}: {NOT_A_DELIVERY_STREAM_WARNING}");
+        return;
+    }
+    let mut tracked = state.firehose_arns.write().await;
+    // Tested under the write lock, so the check and the insert cannot interleave with another
+    // handler's and let the set settle one over the cap.
+    if tracked.len() >= MAX_TRACKED_ARNS {
+        warn!(
+            "not tracking source arn {arn:?}: {AT_CAPACITY_WARNING} at {MAX_TRACKED_ARNS} \
+             entries, so this stream will have no freshness metric"
+        );
+        return;
+    }
+    tracked.insert(arn);
 }
 
 /// Accept a Firehose delivery, or say precisely why not.
@@ -1437,7 +1556,19 @@ mod tests {
     // Source ARN discovery
     // -------------------------------------------------------------------------------------
 
-    const ARN: &str = "arn:aws:firehose:us-east-1:123456789:deliverystream/testStream";
+    /// A well-formed Firehose delivery-stream ARN.
+    ///
+    /// The account ID is **twelve** digits, and that is not cosmetic. `aws_arn`'s
+    /// `AccountIdentifier::is_valid` accepts a plain account ID only at exactly length 12, so
+    /// the nine-digit value this constant used to hold does not parse as an ARN at all --
+    /// `ResourceName::from_str` returns `InvalidAccountId`. It went unnoticed because nothing
+    /// parsed it: `remember_source_arn` stored whatever string it was handed. It was already
+    /// wrong for `get_freshness`, which parses and would have bailed on it.
+    const ARN: &str = "arn:aws:firehose:us-east-1:123456789012:deliverystream/testStream";
+
+    /// A second well-formed delivery-stream ARN, differing from [`ARN`] in every component,
+    /// for the tests that need one the set has not seen.
+    const OTHER_ARN: &str = "arn:aws:firehose:us-west-2:210987654321:deliverystream/otherStream";
 
     #[tokio::test]
     async fn the_source_arn_is_recorded_from_the_header_and_from_the_body() {
@@ -1456,13 +1587,13 @@ mod tests {
         assert!(state.firehose_arns.read().await.contains(ARN));
 
         let with_body_arn =
-            format!(r#"{{"requestId":"{REQ_ID}","source_arn":"other-arn","records":[]}}"#);
+            format!(r#"{{"requestId":"{REQ_ID}","source_arn":"{OTHER_ARN}","records":[]}}"#);
         call(
             app(state.clone()),
             post().body(Body::from(with_body_arn)).unwrap(),
         )
         .await;
-        assert!(state.firehose_arns.read().await.contains("other-arn"));
+        assert!(state.firehose_arns.read().await.contains(OTHER_ARN));
     }
 
     /// The write lock is taken only on a miss. Held read guard + known ARN must not block:
@@ -1496,6 +1627,11 @@ mod tests {
     /// does block the handler. Without this, `a_known_arn_does_not_take_the_write_lock` would
     /// pass just as happily against an implementation that never locked at all, or against a
     /// `RwLock` whose writers do not queue behind readers.
+    ///
+    /// The ARN must be **valid as well as unknown**. A rejected ARN never reaches the write
+    /// lock either, so a placeholder string would turn this control into a test that passes
+    /// for the wrong reason -- proving only that validation ran, while claiming to prove the
+    /// lock is taken.
     #[tokio::test]
     async fn an_unknown_arn_does_take_the_write_lock() {
         let _log = LogTail::start();
@@ -1504,7 +1640,7 @@ mod tests {
         let guard = state.firehose_arns.read().await;
         let body = firehose_body(&[]);
         let request = post()
-            .header("X-Amz-Firehose-Source-Arn", "an-arn-nobody-has-seen")
+            .header("X-Amz-Firehose-Source-Arn", OTHER_ARN)
             .body(Body::from(body))
             .unwrap();
 
@@ -1520,6 +1656,247 @@ mod tests {
              nothing about the read-first path"
         );
         drop(guard);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Source ARN validation
+    // -------------------------------------------------------------------------------------
+
+    /// Send one request carrying `arn` as the source ARN header, and report what the set and
+    /// the log had to say about it. Every validation test below is the same three lines
+    /// otherwise, and a helper keeps the *claim* of each test on one screen.
+    async fn track(arn: &str) -> (AppState, String) {
+        let tail = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        let (status, ..) = call(
+            app(state.clone()),
+            post()
+                .header("X-Amz-Firehose-Source-Arn", arn)
+                .body(Body::from(firehose_body(&[])))
+                .unwrap(),
+        )
+        .await;
+        // A source ARN we refuse to track is not a reason to fail the delivery: the records
+        // are still good, and a non-200 costs the batch a retry it cannot benefit from.
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "rejecting an ARN must not fail the request"
+        );
+        (state, tail.tail())
+    }
+
+    /// The predicate's whole truth table, driven directly.
+    ///
+    /// The router-level tests below prove the predicate is *wired in*; this proves it draws
+    /// the line in the right place, which needs more cases than are worth an HTTP round trip
+    /// each. Both halves are necessary: a table alone would pass with `remember_source_arn`
+    /// ignoring the predicate entirely.
+    #[test]
+    fn only_firehose_delivery_stream_arns_are_accepted() {
+        let _log = LogTail::start();
+        let cases: &[(&str, bool, &str)] = &[
+            (ARN, true, "the canonical shape"),
+            (OTHER_ARN, true, "another region, account and stream"),
+            (
+                "arn:aws-us-gov:firehose:us-gov-west-1:123456789012:deliverystream/gov",
+                true,
+                "non-default partitions are legitimate, not suspicious",
+            ),
+            (
+                "arn:aws:firehose:us-east-1:123456789012:DeliveryStream/casing",
+                true,
+                "the resource type is matched case-insensitively on purpose; see \
+                 `is_delivery_stream_arn`",
+            ),
+            ("", false, "empty"),
+            ("other-arn", false, "not an ARN at all"),
+            ("an-arn-nobody-has-seen", false, "still not an ARN"),
+            (
+                "arn:aws:firehose:us-east-1:123456789:deliverystream/short",
+                false,
+                "a nine-digit account ID is not an account ID",
+            ),
+            (
+                "arn:aws:s3:::my-bucket",
+                false,
+                "well-formed, wrong service",
+            ),
+            (
+                "arn:aws:sqs:us-east-1:123456789012:my-queue",
+                false,
+                "well-formed, wrong service, and it even has an account and region",
+            ),
+            // The two rows below are the only ones that isolate a single check, and they were
+            // added because without them mutation testing showed both checks could be deleted
+            // outright with the suite still green. Real-world ARNs for other services do not
+            // happen to have `deliverystream/<name>` shape, and real Firehose ARNs do not
+            // happen to have another resource type -- so every natural case is rejected twice
+            // over, and neither rejection is attributable. Nothing stops a caller sending
+            // these, which is the whole point.
+            (
+                "arn:aws:kinesis:us-east-1:123456789012:deliverystream/testStream",
+                false,
+                "delivery-stream *shape*, wrong service: the only case the service check \
+                 alone rejects",
+            ),
+            (
+                "arn:aws:firehose:us-east-1:123456789012:stream/testStream",
+                false,
+                "right service, two-component resource, wrong resource type: the only case \
+                 the resource-type check alone rejects",
+            ),
+            (
+                "arn:aws:firehose:us-east-1:123456789012:my-queue",
+                false,
+                "right service, but no resource type -- `split(\"/\").last()` would hand \
+                 CloudWatch the whole resource as a stream name",
+            ),
+            (
+                "arn:aws:firehose:us-east-1:123456789012:deliverystream/",
+                false,
+                "right shape, empty stream name -- the CloudWatch dimension would be blank",
+            ),
+            (
+                "arn:aws:firehose:us-east-1:123456789012:deliverystream/a/b",
+                false,
+                "a delivery stream name cannot contain a path separator",
+            ),
+        ];
+
+        for (candidate, expected, why) in cases {
+            assert_eq!(
+                is_delivery_stream_arn(candidate),
+                *expected,
+                "{candidate:?} ({why})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_arn_that_is_not_an_arn_is_rejected_and_warned() {
+        let (state, log) = track("not-an-arn-at-all").await;
+
+        assert!(
+            state.firehose_arns.read().await.is_empty(),
+            "an unparseable string must not become a tracked ARN"
+        );
+        assert!(
+            log.contains("not-an-arn-at-all") && log.contains(NOT_A_DELIVERY_STREAM_WARNING),
+            "the refusal must name the offending value; got {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_arn_for_another_service_is_rejected_and_warned() {
+        let sqs = "arn:aws:sqs:us-east-1:123456789012:my-queue";
+        let (state, log) = track(sqs).await;
+
+        assert!(
+            state.firehose_arns.read().await.is_empty(),
+            "a well-formed ARN for another service is still not ours to poll"
+        );
+        assert!(
+            log.contains(sqs) && log.contains(NOT_A_DELIVERY_STREAM_WARNING),
+            "the refusal must name the offending value; got {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_firehose_arn_of_another_resource_type_is_rejected_and_warned() {
+        let odd = "arn:aws:firehose:us-east-1:123456789012:my-queue";
+        let (state, log) = track(odd).await;
+
+        assert!(
+            state.firehose_arns.read().await.is_empty(),
+            "`get_freshness` takes the last path segment as the stream name, so a resource \
+             with no `deliverystream/` prefix would produce a query that means nothing"
+        );
+        assert!(
+            log.contains(odd) && log.contains(NOT_A_DELIVERY_STREAM_WARNING),
+            "the refusal must name the offending value; got {log:?}"
+        );
+    }
+
+    /// `MAX_TRACKED_ARNS` distinct, individually-valid ARNs, none of them [`OTHER_ARN`].
+    fn filler_arns(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|i| format!("arn:aws:firehose:us-east-1:123456789012:deliverystream/filler{i}"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_tracked_set_stops_growing_at_the_cap_and_warns() {
+        let tail = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        state
+            .firehose_arns
+            .write()
+            .await
+            .extend(filler_arns(MAX_TRACKED_ARNS));
+
+        let (status, ..) = call(
+            app(state.clone()),
+            post()
+                .header("X-Amz-Firehose-Source-Arn", OTHER_ARN)
+                .body(Body::from(firehose_body(&[])))
+                .unwrap(),
+        )
+        .await;
+        let log = tail.tail();
+
+        assert_eq!(status, StatusCode::OK);
+        let tracked = state.firehose_arns.read().await;
+        assert_eq!(
+            tracked.len(),
+            MAX_TRACKED_ARNS,
+            "the set must not grow past the cap"
+        );
+        assert!(
+            !tracked.contains(OTHER_ARN),
+            "the cap must refuse the newcomer, never evict an incumbent: eviction lets any \
+             caller displace a real delivery stream's tracking"
+        );
+        assert!(
+            log.contains(&MAX_TRACKED_ARNS.to_string()) && log.contains(AT_CAPACITY_WARNING),
+            "a full set must say so, and say what the limit is; got {log:?}"
+        );
+    }
+
+    /// CONTROL for the test above. One slot below the cap, the very same ARN is accepted --
+    /// so the refusal is attributable to the cap and not to `OTHER_ARN` being unacceptable
+    /// for some unrelated reason, and `MAX_TRACKED_ARNS` is proven to be the actual boundary
+    /// rather than merely an upper bound on something smaller.
+    #[tokio::test]
+    async fn the_last_slot_under_the_cap_is_still_filled() {
+        let tail = LogTail::start();
+        let (state, _rx) = state_with_capacity(4);
+        state
+            .firehose_arns
+            .write()
+            .await
+            .extend(filler_arns(MAX_TRACKED_ARNS - 1));
+
+        call(
+            app(state.clone()),
+            post()
+                .header("X-Amz-Firehose-Source-Arn", OTHER_ARN)
+                .body(Body::from(firehose_body(&[])))
+                .unwrap(),
+        )
+        .await;
+        let log = tail.tail();
+
+        let tracked = state.firehose_arns.read().await;
+        assert!(
+            tracked.contains(OTHER_ARN),
+            "control: the last free slot must actually be usable"
+        );
+        assert_eq!(tracked.len(), MAX_TRACKED_ARNS);
+        assert!(
+            !log.contains(AT_CAPACITY_WARNING),
+            "control: nothing was refused, so nothing should have complained; got {log:?}"
+        );
     }
 
     // -------------------------------------------------------------------------------------
