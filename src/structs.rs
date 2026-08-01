@@ -282,6 +282,58 @@ mod tests {
         ));
     }
 
+    /// `known_units_deserialize_to_their_variant` only pins deserialization. `metric_base_name`
+    /// interpolates `MetricUnit`'s `strum::Display` output unsanitized into the series name, and
+    /// only `Count/Second` (pre-existing) is pinned there for separator-free rendering
+    /// (`metric_base_name_renders_compound_unit_without_separators` in series.rs). A new
+    /// variant whose rendering somehow gained a `/` or `.` would slip past both of those and
+    /// only surface as a rejected series name at ingest time.
+    #[test]
+    fn new_units_render_via_display_without_separators() {
+        assert_eq!(MetricUnit::Kilobytes.to_string(), "kilobytes");
+        assert_eq!(MetricUnit::Megabytes.to_string(), "megabytes");
+        assert_eq!(MetricUnit::Gigabytes.to_string(), "gigabytes");
+        assert_eq!(MetricUnit::Terabytes.to_string(), "terabytes");
+        assert_eq!(MetricUnit::Bits.to_string(), "bits");
+        assert_eq!(MetricUnit::Kilobits.to_string(), "kilobits");
+        assert_eq!(MetricUnit::Megabits.to_string(), "megabits");
+        assert_eq!(MetricUnit::Gigabits.to_string(), "gigabits");
+        assert_eq!(MetricUnit::Terabits.to_string(), "terabits");
+        assert_eq!(
+            MetricUnit::KilobytesPerSecond.to_string(),
+            "kilobytes_per_second"
+        );
+        assert_eq!(
+            MetricUnit::MegabytesPerSecond.to_string(),
+            "megabytes_per_second"
+        );
+        assert_eq!(
+            MetricUnit::GigabytesPerSecond.to_string(),
+            "gigabytes_per_second"
+        );
+        assert_eq!(
+            MetricUnit::TerabytesPerSecond.to_string(),
+            "terabytes_per_second"
+        );
+        assert_eq!(MetricUnit::BitsPerSecond.to_string(), "bits_per_second");
+        assert_eq!(
+            MetricUnit::KilobitsPerSecond.to_string(),
+            "kilobits_per_second"
+        );
+        assert_eq!(
+            MetricUnit::MegabitsPerSecond.to_string(),
+            "megabits_per_second"
+        );
+        assert_eq!(
+            MetricUnit::GigabitsPerSecond.to_string(),
+            "gigabits_per_second"
+        );
+        assert_eq!(
+            MetricUnit::TerabitsPerSecond.to_string(),
+            "terabits_per_second"
+        );
+    }
+
     /// The bug this guards: before `#[serde(other)]`, an uncovered unit failed to deserialize
     /// `MetricUnit` at all, which failed the whole `CloudWatchMetric` and dropped the entire
     /// record. Now it degrades to `Unknown` and only that unit's metric is skipped.

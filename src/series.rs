@@ -6,6 +6,7 @@
 //! exhaustively without a server or a runtime.
 
 use crate::consts::PROM_NAMESPACE;
+use crate::prometheus::RECORDS_SKIPPED;
 use crate::structs::{CloudWatchMetric, MetricUnit};
 use convert_case::{Case, Casing};
 use prometheus_remote_write::{Label, Sample};
@@ -293,6 +294,13 @@ pub fn to_series(
             "skipping record with unknown unit: {} {}",
             metric.namespace, metric.metric_name
         );
+        // `Ok(vec![])` looks identical to `parse_lines` as a record with no populated
+        // aggregates, so it increments no counter of its own on that path. Without this,
+        // an unknown unit was a skip visible only in the `warn!` above -- not queryable at
+        // the default log level, and not alertable. Incrementing here, at the point the
+        // record is actually dropped, keeps the count accurate regardless of what any
+        // caller does with the empty result.
+        RECORDS_SKIPPED.inc();
         return Ok(vec![]);
     }
 
@@ -989,7 +997,13 @@ mod tests {
     fn unknown_unit_produces_no_series() {
         let mut m = values_json(r#"{"max":1.0}"#, "Count");
         m.unit = MetricUnit::Unknown;
+        let before = RECORDS_SKIPPED.get();
         assert!(to_series(&m, NOW).unwrap().is_empty());
+        assert_eq!(
+            RECORDS_SKIPPED.get(),
+            before + 1.0,
+            "an unknown-unit skip must be counted, not just logged"
+        );
     }
 
     /// The bug this guards: before `#[serde(other)]` was added to `MetricUnit::Unknown`
@@ -1000,7 +1014,9 @@ mod tests {
     fn record_with_uncovered_unit_deserializes_and_produces_no_series() {
         let m = values_json(r#"{"max":1.0}"#, "SomeFutureUnit");
         assert!(matches!(m.unit, MetricUnit::Unknown));
+        let before = RECORDS_SKIPPED.get();
         assert!(to_series(&m, NOW).unwrap().is_empty());
+        assert_eq!(RECORDS_SKIPPED.get(), before + 1.0);
     }
 
     #[test]
