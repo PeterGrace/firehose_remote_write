@@ -607,7 +607,9 @@ where
     // the await. Although this flush's payload was gathered earlier, the cumulative values
     // preserve every completed flush for the next export; a receiver can calculate average
     // duration with rate(duration_total) / rate(count_total) without sampling one arbitrary
-    // flush. A histogram CANNOT be used here -- see the note in `prometheus.rs`.
+    // flush. "Completed" includes both delivered and retry-exhausted pushes so a remote stall
+    // remains visible; encode failures return above and are excluded because no push occurred.
+    // A histogram CANNOT be used here -- see the note in `prometheus.rs`.
     FLUSH_DURATION_SECONDS_TOTAL.inc_by(started.elapsed().as_secs_f64());
     FLUSH_COUNT_TOTAL.inc();
 }
@@ -2475,11 +2477,14 @@ mod tests {
     async fn a_dropped_batch_is_counted_and_its_size_is_logged() {
         let tail = LogTail::start();
         let before = BATCHES_DROPPED.get();
+        let duration_before = FLUSH_DURATION_SECONDS_TOTAL.get();
+        let count_before = FLUSH_COUNT_TOTAL.get();
         let (tx, rx) = mpsc::channel(16);
         // Threshold of one, a single attempt, and a permanent 503: exactly one dropped batch.
         let config = Config::from_values(Some("3600"), Some("1"), None, Some("1"));
-        let handle = tokio::spawn(run_writer(rx, config, |_body| {
-            std::future::ready(Ok(503u16))
+        let handle = tokio::spawn(run_writer(rx, config, |_body| async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(503u16)
         }));
 
         tx.send(batch("only-series", 1)).await.unwrap();
@@ -2491,6 +2496,16 @@ mod tests {
             BATCHES_DROPPED.get(),
             before + 1.0,
             "an abandoned batch must be counted exactly once"
+        );
+        assert_eq!(
+            FLUSH_DURATION_SECONDS_TOTAL.get() - duration_before,
+            2.0,
+            "a retry-exhausted push must contribute its duration"
+        );
+        assert_eq!(
+            FLUSH_COUNT_TOTAL.get() - count_before,
+            1.0,
+            "a retry-exhausted push must count as one completed flush"
         );
         assert!(
             logs.contains("dropped a batch of 1 series"),
