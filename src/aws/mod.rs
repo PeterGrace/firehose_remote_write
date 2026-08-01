@@ -19,9 +19,7 @@ impl AWSState {
             .load()
             .await;
         let cloudwatch = aws_sdk_cloudwatch::Client::new(&aws_config.clone());
-        AWSState {
-            cloudwatch,
-        }
+        AWSState { cloudwatch }
     }
 }
 #[cached(time = 60, result = true)]
@@ -33,7 +31,14 @@ pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
         dims.push(
             DimensionFilter::builder()
                 .name("DeliveryStreamName")
-                .value(arn.resource.to_string().split("/").last().unwrap().to_string())
+                .value(
+                    arn.resource
+                        .to_string()
+                        .split("/")
+                        .last()
+                        .unwrap()
+                        .to_string(),
+                )
                 .build(),
         );
         let metric_list = aws
@@ -49,21 +54,28 @@ pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
             let dt_now = aws_smithy_types::DateTime::from_secs(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
-                    .as_secs() as i64
+                    .as_secs() as i64,
             );
             let dt_one_min_ago = aws_smithy_types::DateTime::from_secs(
                 (std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
-                    .as_secs() - 60) as i64
+                    .as_secs()
+                    - 60) as i64,
             );
 
-            let metric_stat = MetricStat::builder().metric(metric.clone()).period(60).stat("Maximum").build();
+            let metric_stat = MetricStat::builder()
+                .metric(metric.clone())
+                .period(60)
+                .stat("Maximum")
+                .build();
             let metric_query = MetricDataQuery::builder()
                 .id("m1")
                 .metric_stat(metric_stat)
                 .return_data(true)
                 .build();
-            let response = aws.cloudwatch.get_metric_data()
+            let response = aws
+                .cloudwatch
+                .get_metric_data()
                 .start_time(dt_one_min_ago)
                 .end_time(dt_now)
                 .metric_data_queries(metric_query)
@@ -73,18 +85,19 @@ pub async fn get_freshness(firehose_stream_arn: String) -> anyhow::Result<f64> {
             if response.metric_data_results().len() > 0 {
                 let rs = response.metric_data_results()[0].values();
                 if rs.len() > 0 {
-                    return Ok(rs[0])
+                    return Ok(rs[0]);
                 } else {
                     error!("Received no values for freshness metric; {rs:#?}");
-                    return(Ok(0.0))
+                    return (Ok(0.0));
                 }
             }
         }
-        let msg = format!("Can't find freshness metric for {firehose_stream_arn} dims {:#?}, metriclist is {:#?}", dims, metric_list);
+        let msg = format!(
+            "Can't find freshness metric for {firehose_stream_arn} dims {:#?}, metriclist is {:#?}",
+            dims, metric_list
+        );
         error!(msg);
-        Err(anyhow!(
-            msg
-        ))
+        Err(anyhow!(msg))
     } else {
         Err(anyhow!("Can't parse region from arn"))
     }

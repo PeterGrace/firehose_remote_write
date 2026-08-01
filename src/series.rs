@@ -6,6 +6,7 @@
 //! exhaustively without a server or a runtime.
 
 use crate::consts::PROM_NAMESPACE;
+use crate::prometheus::RECORDS_SKIPPED;
 use crate::structs::{CloudWatchMetric, MetricUnit};
 use convert_case::{Case, Casing};
 use prometheus_remote_write::{Label, Sample};
@@ -282,9 +283,8 @@ const MAX_PAST_MS: i64 = 24 * 60 * 60 * 1000;
 /// `now_ms` is passed in rather than read from the clock so this module stays a total
 /// function of its arguments — no I/O, no hidden inputs, trivially testable.
 ///
-/// Note `MetricUnit::Unknown` is reachable only via `Default`: the enum has no
-/// `#[serde(other)]`, so an unrecognised unit string fails deserialization of the whole
-/// record before this is called (see issue #12).
+/// `MetricUnit` has `#[serde(other)]` on `Unknown`, so an unrecognised unit string reaches
+/// here as `Unknown` rather than failing deserialization of the whole record (issue #12).
 pub fn to_series(
     metric: &CloudWatchMetric,
     now_ms: i64,
@@ -294,6 +294,13 @@ pub fn to_series(
             "skipping record with unknown unit: {} {}",
             metric.namespace, metric.metric_name
         );
+        // `Ok(vec![])` looks identical to `parse_lines` as a record with no populated
+        // aggregates, so it increments no counter of its own on that path. Without this,
+        // an unknown unit was a skip visible only in the `warn!` above -- not queryable at
+        // the default log level, and not alertable. Incrementing here, at the point the
+        // record is actually dropped, keeps the count accurate regardless of what any
+        // caller does with the empty result.
+        RECORDS_SKIPPED.inc();
         return Ok(vec![]);
     }
 
@@ -988,12 +995,28 @@ mod tests {
 
     #[test]
     fn unknown_unit_produces_no_series() {
-        // `MetricUnit` has no `#[serde(other)]`, so an unrecognised unit string fails
-        // deserialization outright rather than becoming `Unknown` (issue #12).
-        // `Unknown` is only reachable via `Default`, so build it directly.
         let mut m = values_json(r#"{"max":1.0}"#, "Count");
         m.unit = MetricUnit::Unknown;
+        let before = RECORDS_SKIPPED.get();
         assert!(to_series(&m, NOW).unwrap().is_empty());
+        assert_eq!(
+            RECORDS_SKIPPED.get(),
+            before + 1.0,
+            "an unknown-unit skip must be counted, not just logged"
+        );
+    }
+
+    /// The bug this guards: before `#[serde(other)]` was added to `MetricUnit::Unknown`
+    /// (issue #12), a unit CloudWatch actually emits but this enum did not yet enumerate
+    /// failed to deserialize `MetricUnit` at all, which failed the whole `CloudWatchMetric`
+    /// and dropped every aggregate in the record -- not just the unrecognised one.
+    #[test]
+    fn record_with_uncovered_unit_deserializes_and_produces_no_series() {
+        let m = values_json(r#"{"max":1.0}"#, "SomeFutureUnit");
+        assert!(matches!(m.unit, MetricUnit::Unknown));
+        let before = RECORDS_SKIPPED.get();
+        assert!(to_series(&m, NOW).unwrap().is_empty());
+        assert_eq!(RECORDS_SKIPPED.get(), before + 1.0);
     }
 
     #[test]
