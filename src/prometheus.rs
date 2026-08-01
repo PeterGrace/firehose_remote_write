@@ -124,16 +124,20 @@ lazy_static! {
     // Help text measured against what the metric actually exports, not against what it is
     // named. `writer::flush` gathers self-metrics *inside* the payload it is building, so the
     // value that reaches the remote is the one held at gather time -- never the value written
-    // after the push. Both of these therefore describe a moment, and the moment is not the
-    // one the obvious reading suggests. See the comments at their `set` call sites.
+    // after the push. See the comments at the call sites.
     pub static ref BUFFER_SERIES: Gauge = register_gauge!(self_metric_opts!(
         "self_buffer_series",
         "Series buffered at the moment the most recent flush began (never observed as 0: the reset after a push is not itself exported)"
     ))
     .unwrap();
-    pub static ref FLUSH_DURATION: Gauge = register_gauge!(self_metric_opts!(
-        "self_flush_duration_seconds",
-        "Duration of the flush BEFORE the most recent one; the current flush's duration is not known until after its own payload has been built"
+    pub static ref FLUSH_DURATION_SECONDS_TOTAL: Counter = register_counter!(self_metric_opts!(
+        "self_flush_duration_seconds_total",
+        "Cumulative duration of completed flushes in seconds"
+    ))
+    .unwrap();
+    pub static ref FLUSH_COUNT_TOTAL: Counter = register_counter!(self_metric_opts!(
+        "self_flush_count_total",
+        "Number of completed flushes"
     ))
     .unwrap();
 }
@@ -293,7 +297,8 @@ mod tests {
         BATCHES_DROPPED.inc();
         REJECTED_PAYLOADS.inc();
         BUFFER_SERIES.set(7.0);
-        FLUSH_DURATION.set(0.25);
+        FLUSH_DURATION_SECONDS_TOTAL.inc_by(0.25);
+        FLUSH_COUNT_TOTAL.inc();
 
         let families = prometheus::gather();
         let labels_of = |name: &str| -> Vec<BTreeMap<String, String>> {
@@ -329,7 +334,8 @@ mod tests {
             "firehose_self_batches_dropped_count",
             "firehose_self_rejected_payloads_count",
             "firehose_self_buffer_series",
-            "firehose_self_flush_duration_seconds",
+            "firehose_self_flush_duration_seconds_total",
+            "firehose_self_flush_count_total",
         ] {
             let children = labels_of(name);
             assert!(!children.is_empty(), "{name} gathered no series at all");
@@ -363,7 +369,8 @@ mod tests {
             "firehose_self_batches_dropped_count",
             "firehose_self_rejected_payloads_count",
             "firehose_self_buffer_series",
-            "firehose_self_flush_duration_seconds",
+            "firehose_self_flush_duration_seconds_total",
+            "firehose_self_flush_count_total",
         ] {
             let children = labels_of(name);
             assert_eq!(
@@ -395,21 +402,25 @@ mod tests {
             "queue_arn must survive alongside the const label, got: {freshness:?}"
         );
 
-        // Gauge semantics, asserted here because this test owns all writes to these two: a
-        // gauge reports the last value set, not an accumulated one. A `Counter` substituted
-        // for `BUFFER_SERIES` would turn "series currently buffered" into "series ever
-        // buffered" while still compiling everywhere it is read.
+        // Gauge semantics: a gauge reports the last value set. A `Counter` substituted for
+        // `BUFFER_SERIES` would turn "series currently buffered" into "series ever buffered"
+        // while still compiling everywhere it is read.
         BUFFER_SERIES.set(10.0);
         BUFFER_SERIES.set(3.0);
-        FLUSH_DURATION.set(1.5);
-        FLUSH_DURATION.set(0.5);
         assert_eq!(BUFFER_SERIES.get(), 3.0);
-        assert_eq!(FLUSH_DURATION.get(), 0.5);
 
-        // And the counters only go up.
+        // The counters accumulate rather than replacing their previous samples.
         let before = RECORDS_SKIPPED.get();
         RECORDS_SKIPPED.inc();
         assert_eq!(RECORDS_SKIPPED.get(), before + 1.0);
+        let duration_before = FLUSH_DURATION_SECONDS_TOTAL.get();
+        let count_before = FLUSH_COUNT_TOTAL.get();
+        FLUSH_DURATION_SECONDS_TOTAL.inc_by(1.5);
+        FLUSH_DURATION_SECONDS_TOTAL.inc_by(0.5);
+        FLUSH_COUNT_TOTAL.inc();
+        FLUSH_COUNT_TOTAL.inc();
+        assert_eq!(FLUSH_DURATION_SECONDS_TOTAL.get(), duration_before + 2.0);
+        assert_eq!(FLUSH_COUNT_TOTAL.get(), count_before + 2.0);
     }
 
     /// The landmine described on the `lazy_static!` block, pinned end to end against the real

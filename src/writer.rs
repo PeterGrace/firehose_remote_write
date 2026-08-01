@@ -1,5 +1,7 @@
 use crate::config::Config;
-use crate::prometheus::{BATCHES_DROPPED, BUFFER_SERIES, FLUSH_DURATION};
+use crate::prometheus::{
+    BATCHES_DROPPED, BUFFER_SERIES, FLUSH_COUNT_TOTAL, FLUSH_DURATION_SECONDS_TOTAL,
+};
 use prometheus::TextEncoder;
 use prometheus_remote_write::{Label, Sample, TimeSeries, WriteRequest};
 use std::collections::{BTreeMap, HashMap};
@@ -494,10 +496,10 @@ const IDLE_HEARTBEAT: Duration = Duration::from_secs(60);
 
 /// Push self-metrics on their own, with no CloudWatch series attached.
 ///
-/// Deliberately *not* a `flush`: nothing is drained, `BUFFER_SERIES` and `FLUSH_DURATION` are
-/// left alone (this is not a flush and reporting it as one would corrupt both), and a failure
-/// does **not** increment `BATCHES_DROPPED` -- no CloudWatch data was lost, so counting it
-/// there would make the data-loss counter fire during an outage in which no data existed.
+/// Deliberately *not* a `flush`: nothing is drained, `BUFFER_SERIES` and the flush counters
+/// are left alone (this is not a flush and reporting it as one would corrupt them), and a
+/// failure does **not** increment `BATCHES_DROPPED` -- no CloudWatch data was lost, so counting
+/// it there would make the data-loss counter fire during an outage in which no data existed.
 /// `push_with_retry` already logs the failure, which is the whole of what is owed here.
 async fn push_heartbeat<F, Fut>(config: &Config, send: &mut F)
 where
@@ -594,12 +596,6 @@ where
         BATCHES_DROPPED.inc();
     }
 
-    // Both of these writes are correct and NEITHER is ever exported by the flush that made
-    // them. `self_metric_series()` above gathers the registry while building *this* payload,
-    // so what goes on the wire is the value each gauge held at gather time. Read the help
-    // text in `prometheus.rs` before concluding either of these is off by one -- they are
-    // phrased against this ordering, deliberately.
-    //
     // `BUFFER_SERIES`: sound because this task is the only writer of `acc` and it is inside
     // `flush`, so no batch can have been accumulated during the push -- anything that arrived
     // is still in the channel, uncounted, and will set this again on the next receive. But
@@ -607,20 +603,13 @@ where
     // exported value is always the pre-drain depth and the remote never sees 0 at all.
     BUFFER_SERIES.set(0.0);
 
-    // `FLUSH_DURATION`: exported one flush late, and not fixable without gathering twice.
-    // The duration cannot be known until the push returns, and the payload carrying it was
-    // built before the push began -- so flush N's own duration first reaches the wire inside
-    // flush N+1. Ordering these two lines differently does not help; the only fix is a second
-    // gather after the push, which means a second request. Recorded because the symptom
-    // ("the graph lags the incident by exactly one scrape") reads like an off-by-one bug and
-    // is not one.
-    //
-    // Also worth knowing before trusting this metric: it is a gauge sampled once per flush,
-    // so at a 1s interval a 15-60s scrape sees one flush in 15-60, chosen arbitrarily. It
-    // will show a sustained slowdown and can miss a 30s retry stall entirely. A `_total`
-    // counter pair or a max-since-export gauge would fix that; a histogram CANNOT be used
-    // here -- see the note on the `lazy_static!` block in `prometheus.rs`.
-    FLUSH_DURATION.set(started.elapsed().as_secs_f64());
+    // These counters are updated after the push because its duration is unknowable before
+    // the await. Although this flush's payload was gathered earlier, the cumulative values
+    // preserve every completed flush for the next export; a receiver can calculate average
+    // duration with rate(duration_total) / rate(count_total) without sampling one arbitrary
+    // flush. A histogram CANNOT be used here -- see the note in `prometheus.rs`.
+    FLUSH_DURATION_SECONDS_TOTAL.inc_by(started.elapsed().as_secs_f64());
+    FLUSH_COUNT_TOTAL.inc();
 }
 
 #[cfg(test)]
@@ -1881,7 +1870,7 @@ mod tests {
     //
     // # Every test here holds a `LogTail`, and it is the isolation, not just the capture
     //
-    // `run_writer` writes `BUFFER_SERIES`, `FLUSH_DURATION` and `BATCHES_DROPPED`, which are
+    // `run_writer` writes `BUFFER_SERIES`, the flush counters and `BATCHES_DROPPED`, which are
     // plain (non-`Vec`) self-metrics with a const `instance` label and therefore *one*
     // process-wide value each — there is no dimension to isolate a test on. Two writer tests
     // running concurrently would race on them, and so would
@@ -2431,14 +2420,16 @@ mod tests {
     /// two floats. The `LogTail` lock keeps them away from `prometheus.rs`'s reader of the
     /// same statics; keeping them in one test keeps them away from each other.
     ///
-    /// `FLUSH_DURATION` is asserted against a *virtual* two-second push, which is why the send
-    /// closure sleeps instead of returning `ready`: with an instant push the gauge would read
-    /// 0.0 and an assertion of `>= 0.0` would be satisfied by a gauge that is never set at all.
+    /// Flush duration is asserted against a *virtual* two-second push, which is why the send
+    /// closure sleeps instead of returning `ready`: with an instant push the counter delta
+    /// would be 0.0 and an assertion of `>= 0.0` would pass if it were never updated at all.
     #[tokio::test(start_paused = true)]
     async fn the_writer_reports_its_buffer_depth_and_flush_duration() {
         let _log = LogTail::start();
         let (tx, rx) = mpsc::channel(16);
         let config = Config::from_values(Some("3600"), Some("3"), None, Some("1"));
+        let duration_before = FLUSH_DURATION_SECONDS_TOTAL.get();
+        let count_before = FLUSH_COUNT_TOTAL.get();
         let handle = tokio::spawn(run_writer(rx, config, |_body| async {
             tokio::time::sleep(Duration::from_secs(2)).await;
             Ok(200u16)
@@ -2464,9 +2455,14 @@ mod tests {
             "the buffer must read empty once it has been drained and pushed"
         );
         assert_eq!(
-            FLUSH_DURATION.get(),
+            FLUSH_DURATION_SECONDS_TOTAL.get() - duration_before,
             2.0,
-            "flush duration must measure the push, not the bookkeeping around it"
+            "flush duration total must accumulate the push duration"
+        );
+        assert_eq!(
+            FLUSH_COUNT_TOTAL.get() - count_before,
+            1.0,
+            "flush count must increment exactly once per completed flush"
         );
     }
 
