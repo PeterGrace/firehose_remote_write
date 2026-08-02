@@ -116,6 +116,11 @@ lazy_static! {
         "Batches abandoned after exhausting retries"
     ))
     .unwrap();
+    pub static ref HIGH_WATER_SAMPLES_DROPPED: Counter = register_counter!(self_metric_opts!(
+        "self_high_water_samples_dropped_count",
+        "Samples dropped because their timestamp was at or below the series high-water mark"
+    ))
+    .unwrap();
     pub static ref REJECTED_PAYLOADS: Counter = register_counter!(self_metric_opts!(
         "self_rejected_payloads_count",
         "Payloads rejected because the buffer was full"
@@ -128,6 +133,11 @@ lazy_static! {
     pub static ref BUFFER_SERIES: Gauge = register_gauge!(self_metric_opts!(
         "self_buffer_series",
         "Series buffered at the moment the most recent flush began (never observed as 0: the reset after a push is not itself exported)"
+    ))
+    .unwrap();
+    pub static ref HIGH_WATER_SERIES: Gauge = register_gauge!(self_metric_opts!(
+        "self_high_water_series",
+        "Series currently tracked by the writer high-water mark"
     ))
     .unwrap();
     pub static ref FLUSH_DURATION_SECONDS_TOTAL: Counter = register_counter!(self_metric_opts!(
@@ -295,8 +305,10 @@ mod tests {
         STREAMS_RECEIVED.inc();
         RECORDS_SKIPPED.inc();
         BATCHES_DROPPED.inc();
+        HIGH_WATER_SAMPLES_DROPPED.inc();
         REJECTED_PAYLOADS.inc();
         BUFFER_SERIES.set(7.0);
+        HIGH_WATER_SERIES.set(4.0);
         FLUSH_DURATION_SECONDS_TOTAL.inc_by(0.25);
         FLUSH_COUNT_TOTAL.inc();
 
@@ -332,8 +344,10 @@ mod tests {
             "firehose_self_remote_writes_sent_count",
             "firehose_self_records_skipped_count",
             "firehose_self_batches_dropped_count",
+            "firehose_self_high_water_samples_dropped_count",
             "firehose_self_rejected_payloads_count",
             "firehose_self_buffer_series",
+            "firehose_self_high_water_series",
             "firehose_self_flush_duration_seconds_total",
             "firehose_self_flush_count_total",
         ] {
@@ -367,8 +381,10 @@ mod tests {
             "firehose_self_kinesis_payloads_received_count",
             "firehose_self_records_skipped_count",
             "firehose_self_batches_dropped_count",
+            "firehose_self_high_water_samples_dropped_count",
             "firehose_self_rejected_payloads_count",
             "firehose_self_buffer_series",
+            "firehose_self_high_water_series",
             "firehose_self_flush_duration_seconds_total",
             "firehose_self_flush_count_total",
         ] {
