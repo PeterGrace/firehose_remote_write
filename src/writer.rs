@@ -1,5 +1,7 @@
 use crate::config::Config;
-use crate::prometheus::{BATCHES_DROPPED, BUFFER_SERIES, FLUSH_DURATION};
+use crate::prometheus::{
+    BATCHES_DROPPED, BUFFER_SERIES, FLUSH_DURATION, HIGH_WATER_SAMPLES_DROPPED, HIGH_WATER_SERIES,
+};
 use prometheus::TextEncoder;
 use prometheus_remote_write::{Label, Sample, TimeSeries, WriteRequest};
 use std::collections::{BTreeMap, HashMap};
@@ -33,6 +35,52 @@ use tokio::time::Instant;
 #[derive(Default)]
 pub struct Accumulator {
     series: HashMap<Vec<Label>, BTreeMap<i64, f64>>,
+}
+
+const HIGH_WATER_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+
+#[derive(Debug)]
+struct HighWaterEntry {
+    timestamp: i64,
+    last_touched: Instant,
+}
+
+/// Successfully delivered timestamp state, owned exclusively by the writer task.
+#[derive(Default)]
+struct HighWaterMarks {
+    series: HashMap<Vec<Label>, HighWaterEntry>,
+}
+
+impl HighWaterMarks {
+    fn accepts(&mut self, labels: &[Label], timestamp: i64, now: Instant) -> bool {
+        let Some(entry) = self.series.get_mut(labels) else {
+            return true;
+        };
+        entry.last_touched = now;
+        timestamp > entry.timestamp
+    }
+
+    fn record_delivered(&mut self, delivered: &[(Vec<Label>, i64)], now: Instant) {
+        for (labels, timestamp) in delivered {
+            self.series
+                .entry(labels.clone())
+                .and_modify(|entry| {
+                    entry.timestamp = entry.timestamp.max(*timestamp);
+                    entry.last_touched = now;
+                })
+                .or_insert(HighWaterEntry {
+                    timestamp: *timestamp,
+                    last_touched: now,
+                });
+        }
+        HIGH_WATER_SERIES.set(self.series.len() as f64);
+    }
+
+    fn evict_stale(&mut self, now: Instant) {
+        self.series
+            .retain(|_, entry| now.saturating_duration_since(entry.last_touched) < HIGH_WATER_TTL);
+        HIGH_WATER_SERIES.set(self.series.len() as f64);
+    }
 }
 
 impl Accumulator {
@@ -403,6 +451,7 @@ where
     Fut: Future<Output = anyhow::Result<u16>>,
 {
     let mut acc = Accumulator::new();
+    let mut high_water = HighWaterMarks::default();
     let period = Duration::from_secs(config.flush_interval_secs);
 
     // `interval_at(now + period, ...)`, NOT `interval(period)`. `tokio::time::interval`
@@ -435,8 +484,14 @@ where
         let should_flush = tokio::select! {
             received = rx.recv() => match received {
                 Some(batch) => {
+                    let now = Instant::now();
+                    high_water.evict_stale(now);
                     for (labels, sample) in batch {
-                        acc.insert(labels, sample);
+                        if high_water.accepts(&labels, sample.timestamp, now) {
+                            acc.insert(labels, sample);
+                        } else {
+                            HIGH_WATER_SAMPLES_DROPPED.inc();
+                        }
                     }
                     BUFFER_SERIES.set(acc.series_count() as f64);
                     acc.series_count() >= config.flush_max_series
@@ -453,11 +508,14 @@ where
                             acc.series_count()
                         );
                     }
-                    flush(&mut acc, &config, &mut send).await;
+                    flush(&mut acc, &mut high_water, &config, &mut send).await;
                     return;
                 }
             },
-            _ = ticker.tick() => true,
+            _ = ticker.tick() => {
+                high_water.evict_stale(Instant::now());
+                true
+            },
         };
 
         if should_flush {
@@ -469,7 +527,7 @@ where
                     last_push_attempt = Instant::now();
                 }
             } else {
-                flush(&mut acc, &config, &mut send).await;
+                flush(&mut acc, &mut high_water, &config, &mut send).await;
                 last_push_attempt = Instant::now();
             }
         }
@@ -565,8 +623,12 @@ where
 ///
 /// Note that the accumulator is *already drained* by the time this can fire, so this arm is a
 /// real data-loss path and not merely a skipped push — which is why it counts the batch.
-async fn flush<F, Fut>(acc: &mut Accumulator, config: &Config, send: &mut F)
-where
+async fn flush<F, Fut>(
+    acc: &mut Accumulator,
+    high_water: &mut HighWaterMarks,
+    config: &Config,
+    send: &mut F,
+) where
     F: FnMut(Vec<u8>) -> Fut,
     Fut: Future<Output = anyhow::Result<u16>>,
 {
@@ -576,7 +638,17 @@ where
 
     let started = tokio::time::Instant::now();
     let series_count = acc.series_count();
-    let request = build_request(acc.drain(), self_metric_series());
+    let cloudwatch = acc.drain();
+    let delivered = cloudwatch
+        .iter()
+        .filter_map(|series| {
+            series
+                .samples
+                .last()
+                .map(|sample| (series.labels.clone(), sample.timestamp))
+        })
+        .collect::<Vec<_>>();
+    let request = build_request(cloudwatch, self_metric_series());
 
     let body = match request.encode_compressed() {
         Ok(b) => b,
@@ -592,6 +664,8 @@ where
     if push_with_retry(body, config.push_max_attempts, &mut *send).await == PushOutcome::Dropped {
         error!("dropped a batch of {series_count} series after exhausting the push policy");
         BATCHES_DROPPED.inc();
+    } else {
+        high_water.record_delivered(&delivered, Instant::now());
     }
 
     // Both of these writes are correct and NEITHER is ever exported by the flush that made
@@ -644,6 +718,91 @@ mod tests {
             .iter()
             .map(|s| (s.timestamp, s.value))
             .collect()
+    }
+
+    #[test]
+    fn high_water_rejects_equal_and_older_samples_after_delivery() {
+        let now = Instant::now();
+        let mut marks = HighWaterMarks::default();
+        let delivered = (labels("m"), 200);
+
+        marks.record_delivered(&[delivered], now);
+
+        assert!(!marks.accepts(&labels("m"), 199, now));
+        assert!(!marks.accepts(&labels("m"), 200, now));
+        assert!(marks.accepts(&labels("m"), 201, now));
+        assert!(marks.accepts(&labels("other"), 1, now));
+    }
+
+    #[test]
+    fn undelivered_samples_do_not_advance_the_high_water_mark() {
+        let now = Instant::now();
+        let mut marks = HighWaterMarks::default();
+
+        assert!(marks.accepts(&labels("m"), 200, now));
+        assert!(marks.accepts(&labels("m"), 100, now));
+        assert!(marks.series.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_successful_flush_advances_the_high_water_mark() {
+        let _log = LogTail::start();
+        let mut acc = Accumulator::new();
+        acc.insert(
+            labels("m"),
+            Sample {
+                value: 1.0,
+                timestamp: 200,
+            },
+        );
+        let mut marks = HighWaterMarks::default();
+        let config = Config::from_values(None, None, None, Some("1"));
+
+        flush(&mut acc, &mut marks, &config, &mut |_body| async {
+            Ok(200u16)
+        })
+        .await;
+
+        assert!(!marks.accepts(&labels("m"), 200, Instant::now()));
+        assert!(marks.accepts(&labels("m"), 201, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_does_not_advance_the_high_water_mark() {
+        let _log = LogTail::start();
+        let mut acc = Accumulator::new();
+        acc.insert(
+            labels("m"),
+            Sample {
+                value: 1.0,
+                timestamp: 200,
+            },
+        );
+        let mut marks = HighWaterMarks::default();
+        let config = Config::from_values(None, None, None, Some("1"));
+
+        flush(&mut acc, &mut marks, &config, &mut |_body| async {
+            Ok(400u16)
+        })
+        .await;
+
+        assert!(marks.accepts(&labels("m"), 200, Instant::now()));
+        assert!(marks.series.is_empty());
+    }
+
+    #[test]
+    fn high_water_entries_expire_after_two_hours_without_a_touch() {
+        let now = Instant::now();
+        let delivered = (labels("m"), 200);
+        let mut marks = HighWaterMarks::default();
+        marks.record_delivered(&[delivered], now);
+
+        marks.evict_stale(now + HIGH_WATER_TTL - Duration::from_millis(1));
+        assert_eq!(marks.series.len(), 1);
+
+        marks.evict_stale(now + HIGH_WATER_TTL);
+        assert!(marks.series.is_empty());
+        assert!(marks.accepts(&labels("m"), 100, now + HIGH_WATER_TTL));
     }
 
     #[test]

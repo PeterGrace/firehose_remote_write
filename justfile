@@ -8,6 +8,12 @@ tag := `git describe --tags 2>/dev/null|| echo dev`
 
 default: build image
 
+fmt:
+  cargo fmt --all
+
+test:
+  cargo test --all-targets
+
 build:
   cross build --release --target x86_64-unknown-linux-gnu
 
