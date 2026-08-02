@@ -57,6 +57,8 @@ impl HighWaterMarks {
         let Some(entry) = self.series.get_mut(labels) else {
             return true;
         };
+        // A rejected replay is still activity: retaining its mark is what lets us keep
+        // rejecting it. Only series that genuinely stop arriving should age out.
         entry.last_touched = now;
         timestamp > entry.timestamp
     }
@@ -643,6 +645,8 @@ async fn flush<F, Fut>(
     let delivered = cloudwatch
         .iter()
         .filter_map(|series| {
+            // `Accumulator::drain` preserves its BTreeMap timestamp order, so the last
+            // sample is the maximum timestamp and therefore the mark delivery establishes.
             series
                 .samples
                 .last()
@@ -2181,6 +2185,54 @@ mod tests {
         within("the writer to exit", handle).await.unwrap();
     }
 
+    /// Pin the complete replay path, not just its pieces: a successful push establishes the
+    /// mark, an equal-timestamp revision is counted and omitted, and a newer sample still
+    /// reaches the wire. This fails if the receive loop bypasses either `accepts`, the drop
+    /// counter, or delivery-gated `record_delivered`.
+    #[tokio::test(start_paused = true)]
+    async fn delivered_replay_is_counted_and_omitted_end_to_end() {
+        let _log = LogTail::start();
+        let dropped_before = HIGH_WATER_SAMPLES_DROPPED.get();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values(Some("3600"), Some("1"), None, Some("1"));
+        let handle = tokio::spawn(run_writer(rx, config, send));
+
+        tx.send(batch("replayed", 100)).await.unwrap();
+        let first = within("the original sample to flush", flushes.recv())
+            .await
+            .expect("writer should still be running");
+        let first = decode_body(&first);
+        let original = find_series(&first.timeseries, "replayed")
+            .expect("the original sample must reach the wire");
+        assert_eq!(samples_of(original), vec![(100, 1.0)]);
+
+        tx.send(batch("replayed", 100)).await.unwrap();
+        let_the_writer_catch_up().await;
+        assert_eq!(
+            HIGH_WATER_SAMPLES_DROPPED.get(),
+            dropped_before + 1.0,
+            "the equal-timestamp replay must increment the drop counter"
+        );
+        assert!(
+            flushes.try_recv().is_err(),
+            "a batch emptied by the high-water filter must not push"
+        );
+
+        tx.send(batch("replayed", 101)).await.unwrap();
+        let second = within("the newer sample to flush", flushes.recv())
+            .await
+            .expect("writer should still be running");
+        let second = decode_body(&second);
+        let newer = find_series(&second.timeseries, "replayed")
+            .expect("a sample above the mark must reach the wire");
+        assert_eq!(samples_of(newer), vec![(101, 1.0)]);
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+        assert!(flushes.try_recv().is_err(), "expected exactly two pushes");
+    }
+
     #[tokio::test]
     async fn writer_flushes_remaining_series_on_shutdown() {
         let _log = LogTail::start();
@@ -2614,10 +2666,10 @@ mod tests {
             0.0,
             "the buffer must read empty once it has been drained and pushed"
         );
-        assert_eq!(
-            FLUSH_DURATION_SECONDS_TOTAL.get() - duration_before,
-            2.0,
-            "flush duration total must accumulate the push duration"
+        let duration_delta = FLUSH_DURATION_SECONDS_TOTAL.get() - duration_before;
+        assert!(
+            (duration_delta - 2.0).abs() < 1e-9,
+            "flush duration total must accumulate the push duration, got {duration_delta}"
         );
         assert_eq!(
             FLUSH_COUNT_TOTAL.get() - count_before,
@@ -2655,10 +2707,10 @@ mod tests {
             before + 1.0,
             "an abandoned batch must be counted exactly once"
         );
-        assert_eq!(
-            FLUSH_DURATION_SECONDS_TOTAL.get() - duration_before,
-            2.0,
-            "a retry-exhausted push must contribute its duration"
+        let duration_delta = FLUSH_DURATION_SECONDS_TOTAL.get() - duration_before;
+        assert!(
+            (duration_delta - 2.0).abs() < 1e-9,
+            "a retry-exhausted push must contribute its duration, got {duration_delta}"
         );
         assert_eq!(
             FLUSH_COUNT_TOTAL.get() - count_before,
