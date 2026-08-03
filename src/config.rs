@@ -6,6 +6,7 @@ pub struct Config {
     pub flush_max_series: usize,
     pub channel_capacity: usize,
     pub push_max_attempts: u32,
+    pub reorder_delay_secs: u64,
 }
 
 /// Parse one environment-derived value, falling back to `default` and saying so.
@@ -43,11 +44,32 @@ fn parse_or<T: std::str::FromStr + std::fmt::Display>(
 
 impl Config {
     /// Split out from `from_env` so the parsing is testable without touching process env.
+    #[cfg(test)]
     pub fn from_values(
         flush_interval_secs: Option<&str>,
         flush_max_series: Option<&str>,
         channel_capacity: Option<&str>,
         push_max_attempts: Option<&str>,
+    ) -> Self {
+        Self::from_values_with_reorder_delay(
+            flush_interval_secs,
+            flush_max_series,
+            channel_capacity,
+            push_max_attempts,
+            None,
+        )
+    }
+
+    /// Parse all settings, including the reorder window.
+    ///
+    /// Kept separate from `from_values` so existing callers that only need the original
+    /// writer settings continue to use the production default for the new delay.
+    pub fn from_values_with_reorder_delay(
+        flush_interval_secs: Option<&str>,
+        flush_max_series: Option<&str>,
+        channel_capacity: Option<&str>,
+        push_max_attempts: Option<&str>,
+        reorder_delay_secs: Option<&str>,
     ) -> Self {
         let flush_interval_secs = parse_or("FLUSH_INTERVAL_SECS", flush_interval_secs, 1u64);
         let flush_max_series = parse_or("FLUSH_MAX_SERIES", flush_max_series, 2000usize);
@@ -87,15 +109,20 @@ impl Config {
             // Under the old name, 0 and 1 both produced a single attempt -- two settings, one
             // behaviour, and a name implying otherwise. The floor is honest against this name.
             push_max_attempts: parse_or("PUSH_MAX_ATTEMPTS", push_max_attempts, 3u32),
+            // Zero deliberately disables reordering. Unlike a zero flush interval or channel
+            // capacity, it is coherent and useful when minimum latency matters more than
+            // tolerating cross-batch delivery disorder.
+            reorder_delay_secs: parse_or("REORDER_DELAY_SECS", reorder_delay_secs, 60u64),
         }
     }
 
     pub fn from_env() -> Self {
-        Self::from_values(
+        Self::from_values_with_reorder_delay(
             env::var("FLUSH_INTERVAL_SECS").ok().as_deref(),
             env::var("FLUSH_MAX_SERIES").ok().as_deref(),
             env::var("CHANNEL_CAPACITY").ok().as_deref(),
             env::var("PUSH_MAX_ATTEMPTS").ok().as_deref(),
+            env::var("REORDER_DELAY_SECS").ok().as_deref(),
         )
     }
 }
@@ -113,6 +140,7 @@ mod tests {
         assert_eq!(c.flush_max_series, 2000);
         assert_eq!(c.channel_capacity, 1024);
         assert_eq!(c.push_max_attempts, 3);
+        assert_eq!(c.reorder_delay_secs, 60);
     }
 
     #[test]
@@ -123,6 +151,18 @@ mod tests {
         assert_eq!(c.flush_max_series, 10);
         assert_eq!(c.channel_capacity, 20);
         assert_eq!(c.push_max_attempts, 7);
+        assert_eq!(c.reorder_delay_secs, 60);
+    }
+
+    #[test]
+    fn reorder_delay_is_configurable_and_zero_disables_it() {
+        let _log = LogTail::start();
+        let configured =
+            Config::from_values_with_reorder_delay(None, None, None, None, Some("120"));
+        assert_eq!(configured.reorder_delay_secs, 120);
+
+        let disabled = Config::from_values_with_reorder_delay(None, None, None, None, Some("0"));
+        assert_eq!(disabled.reorder_delay_secs, 0);
     }
 
     #[test]
@@ -242,16 +282,17 @@ mod tests {
     ///
     /// All process-env mutation in this crate's tests is confined to this one function so it
     /// cannot race a sibling: `cargo test` runs tests as threads in one process, and nothing
-    /// else here reads these four variables. The values are pairwise distinct so a
+    /// else here reads these five variables. The values are pairwise distinct so a
     /// transposition cannot pass.
     #[test]
     fn from_env_reads_each_variable_into_its_own_field() {
         let _log = LogTail::start();
-        const VARS: [(&str, &str); 4] = [
+        const VARS: [(&str, &str); 5] = [
             ("FLUSH_INTERVAL_SECS", "11"),
             ("FLUSH_MAX_SERIES", "22"),
             ("CHANNEL_CAPACITY", "33"),
             ("PUSH_MAX_ATTEMPTS", "44"),
+            ("REORDER_DELAY_SECS", "55"),
         ];
         for (k, v) in VARS {
             env::set_var(k, v);
@@ -267,6 +308,7 @@ mod tests {
         assert_eq!(c.flush_max_series, 22);
         assert_eq!(c.channel_capacity, 33);
         assert_eq!(c.push_max_attempts, 44);
+        assert_eq!(c.reorder_delay_secs, 55);
 
         // With the variables removed again, `from_env` must fall back to the defaults —
         // which also proves the removal above actually took effect and left no state behind
@@ -276,6 +318,7 @@ mod tests {
         assert_eq!(c.flush_max_series, 2000);
         assert_eq!(c.channel_capacity, 1024);
         assert_eq!(c.push_max_attempts, 3);
+        assert_eq!(c.reorder_delay_secs, 60);
     }
 
     /// Every fallback must be diagnosable from the logs, and must name the variable — a
@@ -381,6 +424,7 @@ mod tests {
             "FLUSH_MAX_SERIES",
             "CHANNEL_CAPACITY",
             "PUSH_MAX_ATTEMPTS",
+            "REORDER_DELAY_SECS",
         ] {
             assert!(
                 !logs.contains(var),
@@ -403,6 +447,7 @@ mod tests {
             "FLUSH_MAX_SERIES",
             "CHANNEL_CAPACITY",
             "PUSH_MAX_ATTEMPTS",
+            "REORDER_DELAY_SECS",
         ] {
             assert!(
                 !logs.contains(var),
