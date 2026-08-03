@@ -7,7 +7,7 @@ use prometheus::TextEncoder;
 use prometheus_remote_write::{Label, Sample, TimeSeries, WriteRequest};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 
@@ -119,6 +119,53 @@ impl Accumulator {
             })
             .collect()
     }
+
+    /// Take samples at or before `cutoff`, retaining newer samples for a later tick.
+    fn drain_eligible(&mut self, cutoff: i64) -> Vec<TimeSeries> {
+        let mut eligible = Vec::new();
+        let mut pending = HashMap::new();
+
+        for (labels, mut samples) in std::mem::take(&mut self.series) {
+            let newer = match cutoff.checked_add(1) {
+                Some(first_newer) => samples.split_off(&first_newer),
+                None => BTreeMap::new(),
+            };
+
+            if samples.is_empty() {
+                if !newer.is_empty() {
+                    pending.insert(labels, newer);
+                }
+                continue;
+            }
+            if !newer.is_empty() {
+                pending.insert(labels.clone(), newer);
+            }
+            eligible.push(TimeSeries {
+                labels,
+                samples: samples
+                    .into_iter()
+                    .map(|(timestamp, value)| Sample { value, timestamp })
+                    .collect(),
+            });
+        }
+
+        self.series = pending;
+        eligible
+    }
+}
+
+/// Current Unix time in milliseconds, matching remote-write sample timestamps.
+fn unix_timestamp_millis() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+fn reorder_cutoff(delay_secs: u64) -> i64 {
+    let delay_millis = i64::try_from(delay_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    unix_timestamp_millis().saturating_sub(delay_millis)
 }
 
 /// Combine CloudWatch series and app self-metrics into one request.
@@ -402,6 +449,12 @@ pub type SeriesBatch = Vec<(Vec<Label>, Sample)>;
 
 /// Own the accumulator and be the only thing that ever pushes.
 ///
+/// CloudWatch samples remain buffered until their timestamp is at least
+/// `REORDER_DELAY_SECS` old. Every eligible drain is timestamp-ordered by the accumulator,
+/// so late records from a subsequent Firehose batch can merge with records already held
+/// instead of arriving behind an advanced high-water mark. Shutdown is the exception: it
+/// drains every remaining sample rather than knowingly losing the newest window.
+///
 /// Generic over the send closure so tests can drive it without an HTTP stack.
 /// Exits when the channel closes, flushing anything still buffered.
 ///
@@ -430,17 +483,16 @@ pub type SeriesBatch = Vec<(Vec<Label>, Sample)>;
 /// accumulated since the last successful flush, and nothing upstream will replay it.**
 ///
 /// There is no write-ahead log and adding one is not obviously right. The exposure is bounded
-/// by `FLUSH_INTERVAL_SECS` (default 1s) plus whatever a push takes, so a normal restart
-/// loses on the order of a second of metrics — for CloudWatch data delivered at minute
-/// granularity and used for dashboards and alerting, that is a gap of at most one datapoint
-/// in a series that is already sampled coarsely. Paying for durability with fsyncs on the
-/// hot path, or with the operational weight of a spool directory that can itself fill up,
-/// buys very little against that.
+/// by `REORDER_DELAY_SECS` (default 60s), plus `FLUSH_INTERVAL_SECS` (default 1s), plus
+/// whatever a push takes. Raising the reorder window therefore raises both metric latency and
+/// the amount of accepted data a crash can destroy. For CloudWatch data delivered at minute
+/// granularity and used for dashboards and alerting, that is normally a small number of
+/// datapoints, but it is an explicit operational trade-off rather than free buffering.
 ///
 /// What *does* follow from this, and is easy to get wrong:
 ///
-/// * **`FLUSH_INTERVAL_SECS` is a durability setting, not just a batching one.** Raising it
-///   to reduce request volume raises the amount of data a crash destroys, linearly.
+/// * **Both delay settings affect durability.** Raising `REORDER_DELAY_SECS` or
+///   `FLUSH_INTERVAL_SECS` raises the amount of in-memory data a crash destroys.
 /// * **Graceful shutdown matters more than it looks.** The channel-closed arm below is the
 ///   only thing that saves the tail of the buffer, and it only runs if the process is allowed
 ///   to finish. A `SIGKILL`, or a container `terminationGracePeriodSeconds` shorter than one
@@ -529,8 +581,12 @@ where
                     push_heartbeat(&config, &mut send).await;
                     last_push_attempt = Instant::now();
                 }
-            } else {
-                flush(&mut acc, &mut high_water, &config, &mut send).await;
+            } else if flush_eligible(&mut acc, &mut high_water, &config, &mut send).await {
+                last_push_attempt = Instant::now();
+            } else if last_push_attempt.elapsed() >= IDLE_HEARTBEAT {
+                // Young CloudWatch samples can keep the accumulator non-empty for the whole
+                // reorder window. They must not suppress the liveness signal while they wait.
+                push_heartbeat(&config, &mut send).await;
                 last_push_attempt = Instant::now();
             }
         }
@@ -639,14 +695,50 @@ async fn flush<F, Fut>(
         return;
     }
 
-    let started = tokio::time::Instant::now();
-    let series_count = acc.series_count();
     let cloudwatch = acc.drain();
+    flush_series(cloudwatch, acc, high_water, config, send).await;
+}
+
+/// Push only samples old enough to have completed the configured reorder window.
+///
+/// Returns whether a push was attempted, allowing the heartbeat clock to distinguish a
+/// threshold check containing only young samples from actual communication with the remote.
+async fn flush_eligible<F, Fut>(
+    acc: &mut Accumulator,
+    high_water: &mut HighWaterMarks,
+    config: &Config,
+    send: &mut F,
+) -> bool
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: Future<Output = anyhow::Result<u16>>,
+{
+    let cloudwatch = acc.drain_eligible(reorder_cutoff(config.reorder_delay_secs));
+    if cloudwatch.is_empty() {
+        return false;
+    }
+
+    flush_series(cloudwatch, acc, high_water, config, send).await;
+    true
+}
+
+async fn flush_series<F, Fut>(
+    cloudwatch: Vec<TimeSeries>,
+    acc: &mut Accumulator,
+    high_water: &mut HighWaterMarks,
+    config: &Config,
+    send: &mut F,
+) where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: Future<Output = anyhow::Result<u16>>,
+{
+    let started = tokio::time::Instant::now();
+    let series_count = cloudwatch.len();
     let delivered = cloudwatch
         .iter()
         .filter_map(|series| {
-            // `Accumulator::drain` preserves its BTreeMap timestamp order, so the last
-            // sample is the maximum timestamp and therefore the mark delivery establishes.
+            // Both accumulator drains preserve BTreeMap timestamp order, so the last sample
+            // is the maximum timestamp and therefore the mark delivery establishes.
             series
                 .samples
                 .last()
@@ -660,6 +752,7 @@ async fn flush<F, Fut>(
         Err(e) => {
             error!("could not encode write request: {e}");
             BATCHES_DROPPED.inc();
+            BUFFER_SERIES.set(acc.series_count() as f64);
             return;
         }
     };
@@ -673,12 +766,9 @@ async fn flush<F, Fut>(
         high_water.record_delivered(&delivered, Instant::now());
     }
 
-    // `BUFFER_SERIES`: sound because this task is the only writer of `acc` and it is inside
-    // `flush`, so no batch can have been accumulated during the push -- anything that arrived
-    // is still in the channel, uncounted, and will set this again on the next receive. But
-    // the next receive is also what overwrites this 0 before anyone gathers it, so the
-    // exported value is always the pre-drain depth and the remote never sees 0 at all.
-    BUFFER_SERIES.set(0.0);
+    // Samples newer than the reorder cutoff remain buffered after an eligible flush. This
+    // task is the accumulator's sole owner, so its current series count is authoritative.
+    BUFFER_SERIES.set(acc.series_count() as f64);
 
     // These counters are updated after the push because its duration is unknowable before
     // the await. Although this flush's payload was gathered earlier, the cumulative values
@@ -888,6 +978,28 @@ mod tests {
         assert_eq!(acc.drain().len(), 1);
         assert_eq!(acc.series_count(), 0);
         assert!(acc.drain().is_empty());
+    }
+
+    #[test]
+    fn eligible_drain_is_inclusive_and_retains_newer_samples() {
+        let mut acc = Accumulator::new();
+        for timestamp in [300, 100, 200] {
+            acc.insert(
+                labels("m"),
+                Sample {
+                    value: timestamp as f64,
+                    timestamp,
+                },
+            );
+        }
+
+        let eligible = acc.drain_eligible(200);
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(samples_of(&eligible[0]), vec![(100, 100.0), (200, 200.0)]);
+        assert_eq!(acc.series_count(), 1);
+
+        let pending = acc.drain();
+        assert_eq!(samples_of(&pending[0]), vec![(300, 300.0)]);
     }
 
     /// The three-sample ordering test above is a *probabilistic* detector, not a guarantee.
@@ -2183,6 +2295,156 @@ mod tests {
 
         drop(tx);
         within("the writer to exit", handle).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_reorder_delay_makes_a_new_sample_eligible_on_the_next_tick() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values_with_reorder_delay(
+            Some("1"),
+            Some("100000"),
+            None,
+            Some("1"),
+            Some("0"),
+        );
+        let handle = tokio::spawn(run_writer(rx, config, send));
+        let now = unix_timestamp_millis();
+
+        tx.send(batch("no_delay", now)).await.unwrap();
+        let body = within("the zero-delay flush", flushes.recv())
+            .await
+            .expect("writer should still be running");
+        let body = decode_body(&body);
+        let series = find_series(&body.timeseries, "no_delay")
+            .expect("zero delay must make the new sample eligible");
+        assert_eq!(samples_of(series), vec![(now, 1.0)]);
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+        assert!(flushes.try_recv().is_err(), "expected exactly one push");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crossing_the_series_threshold_does_not_bypass_the_reorder_window() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values_with_reorder_delay(
+            Some("3600"),
+            Some("2"),
+            None,
+            Some("1"),
+            Some("60"),
+        );
+        let handle = tokio::spawn(run_writer(rx, config, send));
+        let now = unix_timestamp_millis();
+
+        for name in ["young_a", "young_b", "young_c"] {
+            tx.send(batch(name, now)).await.unwrap();
+        }
+        let_the_writer_catch_up().await;
+
+        assert!(
+            flushes.try_recv().is_err(),
+            "the series threshold must not push samples before their reorder delay"
+        );
+        assert_eq!(
+            BUFFER_SERIES.get(),
+            3.0,
+            "young series remain buffered even above the threshold"
+        );
+
+        drop(tx);
+        within("the shutdown drain", flushes.recv())
+            .await
+            .expect("shutdown must drain all three young series");
+        within("the writer to exit", handle).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn young_buffered_samples_do_not_suppress_the_idle_heartbeat() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values_with_reorder_delay(
+            Some("1"),
+            Some("100000"),
+            None,
+            Some("1"),
+            Some("3600"),
+        );
+        let handle = tokio::spawn(run_writer(rx, config, send));
+        let now = unix_timestamp_millis();
+
+        tx.send(batch("still_young", now)).await.unwrap();
+        let heartbeat = within("a heartbeat while young data is buffered", flushes.recv())
+            .await
+            .expect("writer should still be running");
+        let heartbeat = decode_body(&heartbeat);
+        assert!(
+            find_series(&heartbeat.timeseries, "still_young").is_none(),
+            "the heartbeat must not bypass the reorder delay"
+        );
+        assert!(
+            !heartbeat.timeseries.is_empty(),
+            "the heartbeat must carry self-metrics"
+        );
+
+        drop(tx);
+        let shutdown = within("the shutdown drain", flushes.recv())
+            .await
+            .expect("shutdown must flush the young sample");
+        let shutdown = decode_body(&shutdown);
+        assert!(
+            find_series(&shutdown.timeseries, "still_young").is_some(),
+            "the buffered sample must remain available for shutdown"
+        );
+        within("the writer to exit", handle).await.unwrap();
+    }
+
+    /// A cross-batch late sample must leave before a newer sample that is still inside the
+    /// reorder window, even when the newer sample arrived first.
+    #[tokio::test(start_paused = true)]
+    async fn reorder_delay_holds_new_samples_while_late_samples_flush_first() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values_with_reorder_delay(
+            Some("1"),
+            Some("100000"),
+            None,
+            Some("1"),
+            Some("60"),
+        );
+        let handle = tokio::spawn(run_writer(rx, config, send));
+        let now = unix_timestamp_millis();
+        let late = now - 61_000;
+
+        // The newer record arrives first, reproducing cross-batch Firehose disorder.
+        tx.send(batch("reordered", now)).await.unwrap();
+        tx.send(batch("reordered", late)).await.unwrap();
+
+        let first = within("the eligible late sample to flush", flushes.recv())
+            .await
+            .expect("writer should still be running");
+        let first = decode_body(&first);
+        let series = find_series(&first.timeseries, "reordered")
+            .expect("the old sample must reach the first tick");
+        assert_eq!(samples_of(series), vec![(late, 1.0)]);
+
+        drop(tx);
+        let final_flush = within("the shutdown drain", flushes.recv())
+            .await
+            .expect("shutdown must flush the young sample");
+        let final_flush = decode_body(&final_flush);
+        let series = find_series(&final_flush.timeseries, "reordered")
+            .expect("the young sample must be retained until shutdown");
+        assert_eq!(samples_of(series), vec![(now, 1.0)]);
+
+        within("the writer to exit", handle).await.unwrap();
+        assert!(flushes.try_recv().is_err(), "expected exactly two pushes");
     }
 
     /// Pin the complete replay path, not just its pieces: a successful push establishes the
