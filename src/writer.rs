@@ -131,18 +131,22 @@ impl Accumulator {
                 None => BTreeMap::new(),
             };
 
-            if !samples.is_empty() {
-                eligible.push(TimeSeries {
-                    labels: labels.clone(),
-                    samples: samples
-                        .into_iter()
-                        .map(|(timestamp, value)| Sample { value, timestamp })
-                        .collect(),
-                });
+            if samples.is_empty() {
+                if !newer.is_empty() {
+                    pending.insert(labels, newer);
+                }
+                continue;
             }
             if !newer.is_empty() {
-                pending.insert(labels, newer);
+                pending.insert(labels.clone(), newer);
             }
+            eligible.push(TimeSeries {
+                labels,
+                samples: samples
+                    .into_iter()
+                    .map(|(timestamp, value)| Sample { value, timestamp })
+                    .collect(),
+            });
         }
 
         self.series = pending;
