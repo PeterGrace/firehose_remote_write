@@ -22,6 +22,8 @@ Firehose delivery is not timestamp-ordered across batches. The reorder window le
 
 The trade-off is intentional: `REORDER_DELAY_SECS` is added to end-to-end metric latency, and samples inside the window exist only in process memory. Start with 60–120 seconds and tune it against the exported `queue_freshness_seconds` gauge, which reports the maximum age of records still queued in Firehose. A graceful shutdown flushes samples that are still inside the window.
 
+`FLUSH_MAX_SERIES` triggers an eligibility check; it does not bypass the reorder window or impose a hard cap on young samples. The buffer can therefore exceed that threshold, with memory use bounded by the distinct series and samples received during `REORDER_DELAY_SECS`. Size the delay and container memory together.
+
 ## Development
 
 ```sh

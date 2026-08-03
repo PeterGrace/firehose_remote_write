@@ -577,10 +577,13 @@ where
                     push_heartbeat(&config, &mut send).await;
                     last_push_attempt = Instant::now();
                 }
-            } else {
-                if flush_eligible(&mut acc, &mut high_water, &config, &mut send).await {
-                    last_push_attempt = Instant::now();
-                }
+            } else if flush_eligible(&mut acc, &mut high_water, &config, &mut send).await {
+                last_push_attempt = Instant::now();
+            } else if last_push_attempt.elapsed() >= IDLE_HEARTBEAT {
+                // Young CloudWatch samples can keep the accumulator non-empty for the whole
+                // reorder window. They must not suppress the liveness signal while they wait.
+                push_heartbeat(&config, &mut send).await;
+                last_push_attempt = Instant::now();
             }
         }
     }
@@ -2287,6 +2290,113 @@ mod tests {
         .expect("writer should flush once the series threshold is reached");
 
         drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_reorder_delay_makes_a_new_sample_eligible_on_the_next_tick() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values_with_reorder_delay(
+            Some("1"),
+            Some("100000"),
+            None,
+            Some("1"),
+            Some("0"),
+        );
+        let handle = tokio::spawn(run_writer(rx, config, send));
+        let now = unix_timestamp_millis();
+
+        tx.send(batch("no_delay", now)).await.unwrap();
+        let body = within("the zero-delay flush", flushes.recv())
+            .await
+            .expect("writer should still be running");
+        let body = decode_body(&body);
+        let series = find_series(&body.timeseries, "no_delay")
+            .expect("zero delay must make the new sample eligible");
+        assert_eq!(samples_of(series), vec![(now, 1.0)]);
+
+        drop(tx);
+        within("the writer to exit", handle).await.unwrap();
+        assert!(flushes.try_recv().is_err(), "expected exactly one push");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crossing_the_series_threshold_does_not_bypass_the_reorder_window() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values_with_reorder_delay(
+            Some("3600"),
+            Some("2"),
+            None,
+            Some("1"),
+            Some("60"),
+        );
+        let handle = tokio::spawn(run_writer(rx, config, send));
+        let now = unix_timestamp_millis();
+
+        for name in ["young_a", "young_b", "young_c"] {
+            tx.send(batch(name, now)).await.unwrap();
+        }
+        let_the_writer_catch_up().await;
+
+        assert!(
+            flushes.try_recv().is_err(),
+            "the series threshold must not push samples before their reorder delay"
+        );
+        assert_eq!(
+            BUFFER_SERIES.get(),
+            3.0,
+            "young series remain buffered even above the threshold"
+        );
+
+        drop(tx);
+        within("the shutdown drain", flushes.recv())
+            .await
+            .expect("shutdown must drain all three young series");
+        within("the writer to exit", handle).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn young_buffered_samples_do_not_suppress_the_idle_heartbeat() {
+        let _log = LogTail::start();
+        let (send, mut flushes) = flush_spy(200);
+        let (tx, rx) = mpsc::channel(16);
+        let config = Config::from_values_with_reorder_delay(
+            Some("1"),
+            Some("100000"),
+            None,
+            Some("1"),
+            Some("3600"),
+        );
+        let handle = tokio::spawn(run_writer(rx, config, send));
+        let now = unix_timestamp_millis();
+
+        tx.send(batch("still_young", now)).await.unwrap();
+        let heartbeat = within("a heartbeat while young data is buffered", flushes.recv())
+            .await
+            .expect("writer should still be running");
+        let heartbeat = decode_body(&heartbeat);
+        assert!(
+            find_series(&heartbeat.timeseries, "still_young").is_none(),
+            "the heartbeat must not bypass the reorder delay"
+        );
+        assert!(
+            !heartbeat.timeseries.is_empty(),
+            "the heartbeat must carry self-metrics"
+        );
+
+        drop(tx);
+        let shutdown = within("the shutdown drain", flushes.recv())
+            .await
+            .expect("shutdown must flush the young sample");
+        let shutdown = decode_body(&shutdown);
+        assert!(
+            find_series(&shutdown.timeseries, "still_young").is_some(),
+            "the buffered sample must remain available for shutdown"
+        );
         within("the writer to exit", handle).await.unwrap();
     }
 
