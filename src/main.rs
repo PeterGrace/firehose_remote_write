@@ -329,7 +329,7 @@ async fn main() {
         }
     });
 
-    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = TcpListener::bind("[::]:3000").await.unwrap();
     info!("Spawning axum listener.");
     serve_and_drain(listener, app, state, writer, shutdown_signal()).await;
     info!("Drained; exiting.");
