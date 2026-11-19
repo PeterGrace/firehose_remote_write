@@ -15,7 +15,7 @@ test:
   cargo test --all-targets
 
 build:
-  cross build --release --target x86_64-unknown-linux-gnu
+  cross build --release --target x86_64-unknown-linux-gnu --config 'build.build-dir="/target/build"'
 
 image: build
   docker buildx build --push --platform linux/amd64 \
